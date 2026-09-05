@@ -1,0 +1,6 @@
+{
+  "name": "Jeopardy Live Show",
+  "description": "Aplicación interactiva de concurso Jeopardy para eventos y clases con pulsadores en tiempo real por QR, gestión de equipos y efectos de sonido.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
