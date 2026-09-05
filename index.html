@@ -465,12 +465,34 @@
         }
       }
 
-      function persistState(newState) {
+      function persistState(newState, broadcast = true) {
         newState.lastUpdated = Date.now();
         state = newState;
         try {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
         } catch (e) {}
+
+        if (broadcast) {
+          // 1. Transmitir por BroadcastChannel a otras pestañas
+          try {
+            if (bc) bc.postMessage({ action: 'STATE_SNAPSHOT', payload: state, ts: Date.now() });
+          } catch (e) {}
+
+          // 2. Disparar Storage Event para sincronización inmediata entre ventanas
+          try {
+            localStorage.setItem(SYNC_EVENT_KEY, JSON.stringify({ action: 'STATE_SNAPSHOT', payload: state, ts: Date.now() }));
+          } catch (e) {}
+
+          // 3. Transmitir inmediatamente a los teléfonos móviles conectados por WebRTC
+          if (currentRole === 'host' && hostConnections.length > 0) {
+            hostConnections.forEach(c => {
+              if (c.open) c.send({ action: 'STATE_SNAPSHOT', payload: state });
+            });
+          } else if (currentRole === 'player' && playerConnection && playerConnection.open) {
+            playerConnection.send({ action: 'STATE_SNAPSHOT', payload: state });
+          }
+        }
+
         render();
       }
 
@@ -544,8 +566,12 @@
           }
 
           case 'STATE_SNAPSHOT': {
-            if (payload && payload.lastUpdated > state.lastUpdated) {
-              persistState(payload);
+            if (payload && (!state.lastUpdated || payload.lastUpdated >= state.lastUpdated)) {
+              state = payload;
+              try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+              } catch (e) {}
+              render();
             }
             break;
           }
@@ -1349,14 +1375,15 @@
             if (!clue || clue.isAnswered) return;
 
             sound.playSelect();
+            // Activación automática e inmediata de la pista y de los pulsadores móviles
             state.activeClue = {
               ...clue,
               categoryId: cat.id,
               categoryTitle: cat.title,
-              state: 'reading'
+              state: 'buzzing_open'
             };
             state.buzzerState = {
-              isOpen: false,
+              isOpen: true,
               buzzedTeamId: null,
               buzzedPlayerName: null,
               buzzedAt: null,
@@ -1438,20 +1465,6 @@
               </div>
 
               <div class="space-y-4">
-                ${clue.state === 'reading' ? `
-                  <div class="text-center">
-                    <button
-                      id="btn-open-buzzers"
-                      class="py-4 px-8 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white font-black text-sm sm:text-base uppercase tracking-widest shadow-[0_0_30px_rgba(16,185,129,0.5)] border-2 border-white cursor-pointer active:scale-98 transition-all"
-                    >
-                      Habilitar Pulsadores para los Equipos
-                    </button>
-                    <p class="text-xs text-blue-300 mt-2">
-                      Los participantes podrán pulsar desde sus teléfonos móviles.
-                    </p>
-                  </div>
-                ` : ''}
-
                 ${clue.state === 'buzzing_open' ? `
                   <div class="p-4 rounded-2xl bg-[#060CE9]/40 border-2 border-[#FFCC00] text-center animate-pulse-fast">
                     <span class="text-sm sm:text-base font-black text-[#FFCC00] uppercase tracking-widest block">
@@ -1460,7 +1473,7 @@
                     <div class="text-xs text-blue-200 mt-1">
                       ${b.lockedTeams && b.lockedTeams.length > 0
                         ? `Equipos bloqueados temporalmente por fallo: <strong class="text-rose-400">${b.lockedTeams.map(id => state.teams.find(t=>t.id===id)?.name).join(', ')}</strong>`
-                        : 'Todos los equipos habilitados para pulsar.'}
+                        : 'Pulsadores habilitados automáticamente en todos los teléfonos móviles.'}
                     </div>
                   </div>
                 ` : ''}
@@ -1542,18 +1555,6 @@
       }
 
       function attachClueModalEvents() {
-        const btnOpenBuzz = document.getElementById('btn-open-buzzers');
-        if (btnOpenBuzz) {
-          btnOpenBuzz.addEventListener('click', () => {
-            sound.playSelect();
-            state.activeClue.state = 'buzzing_open';
-            state.buzzerState.isOpen = true;
-            state.buzzerState.buzzedTeamId = null;
-            state.buzzerState.answerTimeRemaining = 10;
-            persistState(state);
-          });
-        }
-
         const btnJudgeCorrect = document.getElementById('btn-judge-correct');
         if (btnJudgeCorrect) {
           btnJudgeCorrect.addEventListener('click', () => {
@@ -1777,7 +1778,7 @@
                   >
                     <span>${isLocked ? 'BLOQUEADO' : isBuzzerOpen ? '¡PULSAR!' : 'EN ESPERA'}</span>
                     <span class="text-[11px] font-sans font-bold tracking-normal opacity-80 mt-1">
-                      ${isLocked ? 'Turno rebotado a otro equipo' : isBuzzerOpen ? '¡Toca rápido!' : 'Pista en lectura'}
+                      ${isLocked ? 'Turno rebotado a otro equipo' : isBuzzerOpen ? '¡Toca rápido!' : 'Esperando pregunta en el tablero...'}
                     </span>
                   </button>
                 </div>
