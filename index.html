@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Jeopardy Live Show - Producción</title>
-  <meta name="description" content="Aplicación interactiva de concurso Jeopardy para eventos y clases con pulsadores en tiempo real por QR, gestión de hasta 5 equipos y efectos de sonido." />
+  <title>Jeopardy Live Show - Sincronización en Tiempo Real</title>
+  <meta name="description" content="Juego interactivo de Jeopardy en tiempo real con pulsadores móviles por QR, sincronización instantánea y gestión de hasta 5 equipos." />
 
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -36,6 +36,9 @@
   <!-- Canvas Confetti CDN -->
   <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
 
+  <!-- PeerJS CDN: Permite sincronización P2P WebRTC directa entre teléfono móvil y anfitrión sin servidor -->
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+
   <style>
     * { box-sizing: border-box; }
     body {
@@ -61,8 +64,8 @@
     }
     .animate-shake { animation: shake 0.35s ease-in-out; }
 
-    /* Custom scrollbars for clean presentation */
-    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    /* Barra de desplazamiento discreta y limpia */
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
     ::-webkit-scrollbar-track { background: #000324; }
     ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
     ::-webkit-scrollbar-thumb:hover { background: #334155; }
@@ -76,10 +79,11 @@
       // --- CONSTANTES Y CONFIGURACIÓN BASE ---
       const AUTH_KEY = 'jeopardy_auth_status';
       const STORAGE_KEY = 'jeopardy_game_store';
+      const SYNC_EVENT_KEY = 'jeopardy_sync_action_event';
       const BROADCAST_CHANNEL_NAME = 'jeopardy_global_sync_channel';
-      const PASSWORD_HASH = 'Altair16'; // Clave solicitada
+      const PASSWORD_HASH = 'Altair16'; // Clave obligatoria de anfitrión
 
-      // Colores oficiales para hasta 5 equipos
+      // Colores temáticos oficiales para hasta 5 equipos
       const DEFAULT_TEAMS_TEMPLATE = [
         { id: 'team-1', name: 'Equipo Azul', color: '#2563EB', textColor: '#FFFFFF', score: 0, members: [] },
         { id: 'team-2', name: 'Equipo Rojo', color: '#DC2626', textColor: '#FFFFFF', score: 0, members: [] },
@@ -146,7 +150,7 @@
         }
       ];
 
-      // --- SINTETIZADOR DE AUDIO NATIVO (SIN ARCHIVOS EXTERNOS) ---
+      // --- SINTETIZADOR DE AUDIO NATIVO (WEB AUDIO API) ---
       class SoundSynthesizer {
         constructor() { this.ctx = null; }
         init() {
@@ -166,10 +170,24 @@
           osc.type = 'sine';
           osc.frequency.setValueAtTime(587.33, now);
           osc.frequency.exponentialRampToValueAtTime(1174.66, now + 0.1);
-          gain.gain.setValueAtTime(0.25, now);
+          gain.gain.setValueAtTime(0.2, now);
           gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
           osc.connect(gain); gain.connect(this.ctx.destination);
           osc.start(now); osc.stop(now + 0.11);
+        }
+        playJoin() {
+          this.init(); if (!this.ctx) return;
+          const now = this.ctx.currentTime;
+          [523.25, 659.25].forEach((freq, i) => {
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(freq, now + i * 0.09);
+            gain.gain.setValueAtTime(0.2, now + i * 0.09);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.09 + 0.15);
+            osc.connect(gain); gain.connect(this.ctx.destination);
+            osc.start(now + i * 0.09); osc.stop(now + i * 0.09 + 0.16);
+          });
         }
         playBuzz() {
           this.init(); if (!this.ctx) return;
@@ -231,10 +249,20 @@
       }
       const sound = new SoundSynthesizer();
 
-      // --- ESTADO GLOBAL AUTOCONTENIDO ---
+      // Generador de Room Code para emparejamiento WebRTC P2P
+      function getOrCreateRoomCode() {
+        let code = localStorage.getItem('jeopardy_active_room_code');
+        if (!code) {
+          code = 'JEP' + Math.floor(1000 + Math.random() * 9000);
+          localStorage.setItem('jeopardy_active_room_code', code);
+        }
+        return code;
+      }
+
       function getDefaultState() {
         return {
-          status: 'setup', // 'setup' | 'playing'
+          roomCode: getOrCreateRoomCode(),
+          status: 'setup',
           title: 'Torneo Jeopardy Live Show',
           categories: JSON.parse(JSON.stringify(DEFAULT_CATEGORIES)),
           teamCount: 3,
@@ -249,15 +277,15 @@
             answerTimeLimit: 10,
             answerTimeRemaining: 10,
             playerAnswer: null,
-            lockedTeams: [], // Equipos bloqueados en esta pista por fallo
-            firstAttemptTeamId: null, // Primer equipo que falló
-            buzzOrderQueue: [] // Cola de turnos
+            lockedTeams: [],
+            firstAttemptTeamId: null,
+            hasReboundedToFirst: false
           },
           settings: {
             penalizeWrong: true,
             allowReboundToFirstAfterAllFail: true
           },
-          lastLogoutTimestamp: 0
+          lastUpdated: Date.now()
         };
       }
 
@@ -266,6 +294,7 @@
           const raw = localStorage.getItem(STORAGE_KEY);
           if (raw) {
             const parsed = JSON.parse(raw);
+            if (!parsed.roomCode) parsed.roomCode = getOrCreateRoomCode();
             return parsed;
           }
         } catch (e) {}
@@ -275,56 +304,266 @@
       let state = loadState();
       let isAuthenticated = sessionStorage.getItem(AUTH_KEY) === 'true';
 
-      // Parámetros de URL para distinguir móvil (jugador) vs host
       const urlParams = new URLSearchParams(window.location.search);
       let currentRole = urlParams.get('role') === 'player' ? 'player' : 'host';
       let assignedTeamId = urlParams.get('team') || null;
+      let roomCodeParam = urlParams.get('room') || state.roomCode;
 
-      // BroadcastChannel para sincronizar entre ventanas y dispositivos
+      // --- ARQUITECTURA DE SINCRONIZACIÓN TRIPLE ---
+      // 1. BroadcastChannel (Para pestañas/ventanas del mismo navegador)
+      // 2. Storage Events + Timestamps (Para compatibilidad de almacenamiento local)
+      // 3. WebRTC P2P con PeerJS (Para conectar teléfonos móviles con el anfitrión sin backend)
       let bc = null;
       try {
         if ('BroadcastChannel' in window) {
           bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
           bc.onmessage = (evt) => {
-            if (!evt.data) return;
-            if (evt.data.type === 'STATE_UPDATE') {
-              state = evt.data.state;
-              render();
-            } else if (evt.data.type === 'GLOBAL_LOGOUT') {
-              handleIncomingGlobalLogout();
-            }
+            if (evt.data) handleSyncAction(evt.data.action, evt.data.payload);
           };
         }
       } catch (e) {}
 
+      // Escucha de Storage Events de almacenamiento local
       window.addEventListener('storage', (e) => {
-        if (e.key === STORAGE_KEY && e.newValue) {
+        if (e.key === SYNC_EVENT_KEY && e.newValue) {
           try {
-            state = JSON.parse(e.newValue);
-            render();
+            const data = JSON.parse(e.newValue);
+            handleSyncAction(data.action, data.payload);
           } catch (err) {}
-        } else if (e.key === 'jeopardy_global_logout_ts') {
-          handleIncomingGlobalLogout();
+        } else if (e.key === STORAGE_KEY && e.newValue) {
+          try {
+            const newState = JSON.parse(e.newValue);
+            if (newState.lastUpdated > state.lastUpdated) {
+              state = newState;
+              render();
+            }
+          } catch (err) {}
         }
       });
 
-      function persistAndBroadcast(newState) {
+      // Polling de seguridad de almacenamiento (500ms) para garantizar refresco
+      setInterval(() => {
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw) {
+            const s = JSON.parse(raw);
+            if (s.lastUpdated > state.lastUpdated) {
+              state = s;
+              render();
+            }
+          }
+        } catch (e) {}
+      }, 500);
+
+      // --- CONEXIÓN P2P WEBRTC (PEERJS) ---
+      let hostPeer = null;
+      let hostConnections = [];
+      let playerPeer = null;
+      let playerConnection = null;
+
+      function initNetworkSync() {
+        if (typeof Peer === 'undefined') return;
+
+        if (currentRole === 'host') {
+          // El host registra una ID predecible basada en el roomCode
+          const hostPeerId = `jeopardy-host-${state.roomCode}`;
+          try {
+            hostPeer = new Peer(hostPeerId, { debug: 0 });
+            hostPeer.on('open', () => {
+              console.log('Host P2P iniciado:', hostPeerId);
+              updateNetworkIndicator(true);
+            });
+            hostPeer.on('connection', (conn) => {
+              hostConnections.push(conn);
+              // Enviar estado inicial al jugador recién conectado
+              conn.on('open', () => {
+                conn.send({ action: 'STATE_SNAPSHOT', payload: state });
+              });
+              conn.on('data', (data) => {
+                if (data && data.action) {
+                  handleSyncAction(data.action, data.payload);
+                  // Retransmitir a otros participantes
+                  hostConnections.forEach(c => {
+                    if (c !== conn && c.open) c.send(data);
+                  });
+                }
+              });
+              conn.on('close', () => {
+                hostConnections = hostConnections.filter(c => c !== conn);
+              });
+            });
+            hostPeer.on('error', (err) => {
+              // Si la ID ya estaba tomada, reintentar con sufijo
+              console.warn('Peer host info:', err.type);
+            });
+          } catch (e) {
+            console.warn(e);
+          }
+        } else if (currentRole === 'player') {
+          // El teléfono móvil se conecta al host usando el roomCode del QR
+          const targetHostId = `jeopardy-host-${roomCodeParam}`;
+          try {
+            playerPeer = new Peer(null, { debug: 0 });
+            playerPeer.on('open', () => {
+              playerConnection = playerPeer.connect(targetHostId, { reliable: true });
+              playerConnection.on('open', () => {
+                console.log('Jugador conectado al host P2P:', targetHostId);
+                updateNetworkIndicator(true);
+              });
+              playerConnection.on('data', (data) => {
+                if (data && data.action) {
+                  handleSyncAction(data.action, data.payload);
+                }
+              });
+              playerConnection.on('close', () => {
+                updateNetworkIndicator(false);
+              });
+            });
+          } catch (e) {
+            console.warn(e);
+          }
+        }
+      }
+
+      function updateNetworkIndicator(isConnected) {
+        const dots = document.querySelectorAll('.sync-status-dot');
+        dots.forEach(d => {
+          if (isConnected) {
+            d.classList.remove('bg-amber-400');
+            d.classList.add('bg-emerald-400');
+            d.setAttribute('title', 'Sincronizado en tiempo real (P2P + Storage)');
+          } else {
+            d.classList.remove('bg-emerald-400');
+            d.classList.add('bg-amber-400');
+            d.setAttribute('title', 'Sincronizado vía LocalStorage');
+          }
+        });
+      }
+
+      // Despachador universal de acciones
+      function dispatchAction(action, payload) {
+        // 1. Ejecutar localmente
+        handleSyncAction(action, payload);
+
+        // 2. Transmitir por BroadcastChannel
+        try {
+          if (bc) bc.postMessage({ action, payload, ts: Date.now() });
+        } catch (e) {}
+
+        // 3. Transmitir por Storage Event (cambio forzado de valor)
+        try {
+          localStorage.setItem(SYNC_EVENT_KEY, JSON.stringify({ action, payload, ts: Date.now() }));
+        } catch (e) {}
+
+        // 4. Transmitir por WebRTC DataChannel
+        if (currentRole === 'host' && hostConnections.length > 0) {
+          hostConnections.forEach(c => {
+            if (c.open) c.send({ action, payload });
+          });
+        } else if (currentRole === 'player' && playerConnection && playerConnection.open) {
+          playerConnection.send({ action, payload });
+        }
+      }
+
+      function persistState(newState) {
+        newState.lastUpdated = Date.now();
         state = newState;
         try {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-          if (bc) bc.postMessage({ type: 'STATE_UPDATE', state });
         } catch (e) {}
         render();
       }
 
-      function handleIncomingGlobalLogout() {
-        isAuthenticated = false;
-        sessionStorage.removeItem(AUTH_KEY);
-        if (currentRole === 'player') {
-          localStorage.removeItem('jeopardy_player_name');
-          renderPlayerLoggedOutNotice();
-        } else {
-          render();
+      // Procesador centralizado de acciones sincronizadas
+      function handleSyncAction(action, payload) {
+        switch (action) {
+          case 'PLAYER_JOIN': {
+            const { teamId, memberName, memberId } = payload;
+            const updatedTeams = state.teams.map(t => {
+              if (t.id === teamId) {
+                const existing = t.members.find(m => m.name.toLowerCase() === memberName.toLowerCase());
+                if (!existing) {
+                  // Verificar límite de miembros
+                  if (t.members.length < state.maxMembersPerTeam) {
+                    return {
+                      ...t,
+                      members: [...t.members, { id: memberId || 'm-' + Date.now(), name: memberName, joinedAt: Date.now() }]
+                    };
+                  }
+                }
+              }
+              return t;
+            });
+            sound.playJoin();
+            persistState({ ...state, teams: updatedTeams });
+            break;
+          }
+
+          case 'PLAYER_REMOVE': {
+            const { teamId, memberId } = payload;
+            const updatedTeams = state.teams.map(t => {
+              if (t.id === teamId) {
+                return { ...t, members: t.members.filter(m => m.id !== memberId) };
+              }
+              return t;
+            });
+            persistState({ ...state, teams: updatedTeams });
+            break;
+          }
+
+          case 'PLAYER_BUZZ': {
+            const { teamId, memberName } = payload;
+            if (!state.buzzerState.isOpen || (state.buzzerState.lockedTeams || []).includes(teamId)) {
+              return;
+            }
+            sound.playBuzz();
+            const updatedBuzzer = {
+              ...state.buzzerState,
+              isOpen: false,
+              buzzedTeamId: teamId,
+              buzzedPlayerName: memberName,
+              buzzedAt: Date.now(),
+              answerTimeLimit: 10,
+              answerTimeRemaining: 10,
+              playerAnswer: null
+            };
+            const updatedClue = state.activeClue ? { ...state.activeClue, state: 'buzzed' } : null;
+            persistState({ ...state, activeClue: updatedClue, buzzerState: updatedBuzzer });
+            break;
+          }
+
+          case 'PLAYER_ANSWER': {
+            const { answer } = payload;
+            sound.playSelect();
+            const updatedBuzzer = {
+              ...state.buzzerState,
+              playerAnswer: answer
+            };
+            persistState({ ...state, buzzerState: updatedBuzzer });
+            break;
+          }
+
+          case 'STATE_SNAPSHOT': {
+            if (payload && payload.lastUpdated > state.lastUpdated) {
+              persistState(payload);
+            }
+            break;
+          }
+
+          case 'GLOBAL_LOGOUT': {
+            isAuthenticated = false;
+            sessionStorage.removeItem(AUTH_KEY);
+            localStorage.removeItem('jeopardy_player_name');
+            if (currentRole === 'player') {
+              renderPlayerLoggedOutNotice();
+            } else {
+              render();
+            }
+            break;
+          }
+
+          default:
+            break;
         }
       }
 
@@ -345,7 +584,6 @@
           }
 
           if (state.buzzerState.playerAnswer) {
-            // Ya envió respuesta antes de los 10 segundos
             return;
           }
 
@@ -357,21 +595,12 @@
             handleTeamFailedAnswer(state.buzzerState.buzzedTeamId, true);
           } else {
             const nextB = { ...state.buzzerState, answerTimeRemaining: currentRem - 1 };
-            state.buzzerState = nextB;
-            try {
-              localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-              if (bc) bc.postMessage({ type: 'STATE_UPDATE', state });
-            } catch (e) {}
-            render();
+            persistState({ ...state, buzzerState: nextB });
           }
         }, 1000);
       }
 
-      // LÓGICA ESTRICTA DE TURNOS Y REBOTES:
-      // Si un participante falla, su equipo queda bloqueado temporalmente.
-      // El turno rebota al siguiente equipo en orden.
-      // La oportunidad de reintentar la pista solo regresa al primer equipo una vez que
-      // todos los demás equipos participantes hayan tenido su turno y fallado.
+      // LÓGICA ESTRICTA DE TURNOS Y REBOTES
       function handleTeamFailedAnswer(failedTeamId, isTimeout = false) {
         sound.playWrong();
         const b = state.buzzerState;
@@ -382,10 +611,8 @@
           nextLocked.push(failedTeamId);
         }
 
-        // Registrar quién fue el primer equipo en fallar
         const firstTeam = b.firstAttemptTeamId || failedTeamId;
 
-        // Descontar puntos al equipo que falló si está activa la penalización
         const updatedTeams = state.teams.map(t => {
           if (t.id === failedTeamId && state.settings.penalizeWrong) {
             return { ...t, score: t.score - clue.value };
@@ -393,14 +620,12 @@
           return t;
         });
 
-        // Equipos activos del concurso que aún no han tenido su turno en esta pista
         const allParticipatingTeamIds = updatedTeams.map(t => t.id);
         const unattemptedTeams = allParticipatingTeamIds.filter(id => !nextLocked.includes(id));
 
         let nextState = { ...state, teams: updatedTeams };
 
         if (unattemptedTeams.length > 0) {
-          // Rebota a los equipos restantes no bloqueados abriendo el pulsador para ellos
           nextState.activeClue = { ...clue, state: 'buzzing_open' };
           nextState.buzzerState = {
             ...b,
@@ -415,18 +640,11 @@
             firstAttemptTeamId: firstTeam
           };
         } else {
-          // TODOS los demás equipos han tenido su turno y han fallado
+          // Si todos los demás equipos participantes tuvieron su turno y fallaron:
           if (state.settings.allowReboundToFirstAfterAllFail && allParticipatingTeamIds.length > 1) {
-            // Regla solicitada: La oportunidad de reintentar la pista SOLO regresa al primer equipo
-            // una vez que todos los demás equipos participantes hayan tenido su turno y fallado.
-            // Desbloqueamos únicamente al primer equipo para su segundo y definitivo intento,
-            // o si ya fue el segundo intento, se cierra la pista.
             if (b.hasReboundedToFirst) {
-              // Ya tuvo su segundo intento también; se agotan los intentos y se revela la respuesta
               nextState = closeAndRevealClue(nextState);
             } else {
-              // Se le da la oportunidad de reintentar al primer equipo
-              const firstTeamObj = updatedTeams.find(t => t.id === firstTeam);
               const otherTeams = allParticipatingTeamIds.filter(id => id !== firstTeam);
               nextState.activeClue = { ...clue, state: 'buzzing_open' };
               nextState.buzzerState = {
@@ -438,18 +656,17 @@
                 answerTimeLimit: 10,
                 answerTimeRemaining: 10,
                 playerAnswer: null,
-                lockedTeams: otherTeams, // Solo el primer equipo queda habilitado
+                lockedTeams: otherTeams,
                 firstAttemptTeamId: firstTeam,
                 hasReboundedToFirst: true
               };
             }
           } else {
-            // Todos fallaron y no hay más reintentos
             nextState = closeAndRevealClue(nextState);
           }
         }
 
-        persistAndBroadcast(nextState);
+        persistState(nextState);
       }
 
       function closeAndRevealClue(targetState) {
@@ -494,7 +711,7 @@
           clues: cat.clues.map(c => c.id === clue.id ? { ...c, isAnswered: true } : c)
         }));
 
-        const nextState = {
+        persistState({
           ...state,
           teams: updatedTeams,
           categories: nextCats,
@@ -504,59 +721,44 @@
             isOpen: false,
             answerTimeRemaining: 0
           }
-        };
-        persistAndBroadcast(nextState);
+        });
       }
 
-      // CIERRE DE SESIÓN GLOBAL (Requisito 6)
+      // CIERRE DE SESIÓN GLOBAL
       function executeGlobalLogout() {
         sound.playSelect();
         isAuthenticated = false;
         sessionStorage.removeItem(AUTH_KEY);
-        const logoutTimestamp = Date.now();
-        state.lastLogoutTimestamp = logoutTimestamp;
-
-        try {
-          localStorage.setItem('jeopardy_global_logout_ts', logoutTimestamp.toString());
-          localStorage.removeItem('jeopardy_player_name');
-          if (bc) {
-            bc.postMessage({ type: 'GLOBAL_LOGOUT', timestamp: logoutTimestamp });
-          }
-        } catch (e) {}
-
-        persistAndBroadcast(state);
+        dispatchAction('GLOBAL_LOGOUT', {});
+        render();
       }
 
-      // --- RENDERING ROUTER ---
+      // --- ROUTER DE INTERFAZ ---
       function render() {
         const app = document.getElementById('app');
         if (!app) return;
 
         setupAnswerTimer();
 
-        // 1. Vista para dispositivos móviles (Jugadores)
         if (currentRole === 'player') {
           renderPlayerView(app);
           return;
         }
 
-        // 2. Pantalla de Autenticación Inicial (Requisito 2: Clave Altair16)
         if (!isAuthenticated) {
           renderAuthScreen(app);
           return;
         }
 
-        // 3. Pantalla de Configuración Inicial (Requisito 3 y 4: hasta 5 equipos y QR dinámicos)
         if (state.status === 'setup') {
           renderSetupScreen(app);
           return;
         }
 
-        // 4. Pantalla Principal de Juego (Tablero Jeopardy + Modal de Pista)
         renderGameScreen(app);
       }
 
-      // --- PANTALLA 1: AUTENTICACIÓN OBLIGATORIA (Altair16) ---
+      // 1. PANTALLA DE AUTENTICACIÓN (Altair16)
       function renderAuthScreen(container) {
         container.innerHTML = `
           <div class="min-h-screen flex items-center justify-center p-4 bg-gradient-to-b from-[#000533] via-[#020B4A] to-[#00021A]">
@@ -570,7 +772,7 @@
                   Acceso de Anfitrión
                 </h1>
                 <p class="text-xs sm:text-sm text-blue-200 mt-2">
-                  Ingresa la contraseña obligatoria del sistema para desbloquear el tablero y la configuración.
+                  Introduce la contraseña obligatoria para acceder a la configuración del torneo y el tablero.
                 </p>
               </div>
 
@@ -579,7 +781,7 @@
                   <input
                     id="auth-password"
                     type="password"
-                    placeholder="Introduce la contraseña..."
+                    placeholder="Contraseña del anfitrión..."
                     autocomplete="current-password"
                     class="w-full py-3.5 px-4 pr-12 rounded-xl bg-[#000324] border-2 border-blue-500/70 text-white font-bold text-center tracking-widest placeholder-blue-400/50 outline-none focus:border-[#FFCC00] transition-all"
                     required
@@ -607,9 +809,12 @@
               </form>
 
               <div class="pt-2 border-t border-blue-900/60 flex items-center justify-between text-xs text-blue-300">
-                <span>Versión GitHub Pages 100% Autocontenida</span>
+                <span class="flex items-center gap-1.5">
+                  <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot"></span>
+                  Sincronización en Vivo
+                </span>
                 <a href="?role=player" class="text-[#FFCC00] hover:underline font-bold">
-                  Modo Jugador
+                  Modo Jugador Móvil
                 </a>
               </div>
             </div>
@@ -644,6 +849,7 @@
             sound.playCorrect();
             isAuthenticated = true;
             sessionStorage.setItem(AUTH_KEY, 'true');
+            initNetworkSync();
             render();
           } else {
             sound.playWrong();
@@ -654,12 +860,13 @@
         });
       }
 
-      // --- PANTALLA 2: CONFIGURACIÓN INICIAL (HASTA 5 EQUIPOS + QR COMPLETOS SIN SCROLL) ---
+      // 2. PANTALLA DE CONFIGURACIÓN INICIAL (HASTA 5 EQUIPOS + LISTA EN TIEMPO REAL DE MIEMBROS + SIN SCROLL)
       function renderSetupScreen(container) {
         const teamCount = state.teamCount || state.teams.length;
+        const baseUrl = window.location.href.split('?')[0];
 
         container.innerHTML = `
-          <div class="h-screen flex flex-col bg-[#000533] p-3 overflow-hidden">
+          <div class="h-screen flex flex-col bg-[#000533] p-2.5 sm:p-3 overflow-hidden">
             <!-- Header Compacto -->
             <header class="flex items-center justify-between bg-[#000222] border-2 border-[#D4AF37] rounded-2xl px-4 py-2 mb-2 shadow-md shrink-0">
               <div class="flex items-center gap-3">
@@ -667,11 +874,12 @@
                   J!
                 </div>
                 <div>
-                  <h1 class="text-base font-black text-white uppercase font-cinzel leading-none">
+                  <h1 class="text-base font-black text-white uppercase font-cinzel leading-none flex items-center gap-2">
                     Configuración del Torneo
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse" title="Sincronización en vivo activa"></span>
                   </h1>
                   <span class="text-[11px] text-blue-200">
-                    Ajusta título, equipos (1 a 5), sube preguntas y genera códigos QR dinámicos.
+                    Sala: <strong class="text-[#FFCC00] font-mono">${state.roomCode}</strong> • Participantes reflejados en tiempo real al escanear.
                   </span>
                 </div>
               </div>
@@ -691,7 +899,7 @@
               </div>
             </header>
 
-            <!-- Panel de Controles Superiores Compacto -->
+            <!-- Panel de Controles de Equipos y Preguntas -->
             <div class="bg-[#000842] border-2 border-blue-900/80 rounded-2xl p-3 mb-2 shrink-0 grid grid-cols-1 md:grid-cols-4 gap-3 items-center text-xs">
               <div>
                 <label class="block font-black uppercase tracking-wider text-blue-200 mb-1 text-[11px]">
@@ -755,7 +963,7 @@
                 <button
                   id="btn-default-questions"
                   type="button"
-                  title="Restaurar preguntas por defecto"
+                  title="Restaurar preguntas oficiales"
                   class="py-1.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600 font-bold text-[11px] cursor-pointer"
                 >
                   Por Defecto
@@ -763,19 +971,19 @@
               </div>
             </div>
 
-            <!-- ZONA DE CÓDIGOS QR DINÁMICOS COMPLETOS Y SIN SCROLL (Hasta 5 Equipos) -->
-            <!-- flex-1 y overflow-hidden para asegurar que se vean al 100% sin barra de desplazamiento vertical -->
+            <!-- ZONA DE CÓDIGOS QR DINÁMICOS Y MIEMBROS EN TIEMPO REAL (SIN SCROLL VERTICAL) -->
             <div class="flex-1 bg-[#000222] border-2 border-blue-900/60 rounded-2xl p-2.5 flex flex-col justify-between overflow-hidden shadow-inner">
               <div class="flex items-center justify-between pb-1.5 border-b border-blue-900/80 shrink-0">
-                <span class="text-xs font-black uppercase tracking-wider text-[#FFCC00]">
-                  Códigos QR Dinámicos por Equipo (Muestra Simultánea en Pantalla)
+                <span class="text-xs font-black uppercase tracking-wider text-[#FFCC00] flex items-center gap-2">
+                  <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                  Códigos QR Dinámicos (Registro en Vivo por Equipo)
                 </span>
                 <span class="text-[11px] text-blue-300">
-                  Escanea para unirse directamente con pulsador sincronizado
+                  Total Conectados: <strong class="text-white">${state.teams.slice(0, teamCount).reduce((acc, t) => acc + t.members.length, 0)} participantes</strong>
                 </span>
               </div>
 
-              <!-- Rejilla que acomoda de 1 a 5 equipos sin scroll vertical -->
+              <!-- Rejilla autoajustable para 1 a 5 equipos sin scroll -->
               <div
                 id="qr-cards-grid"
                 class="grid gap-2 my-1.5 flex-1 items-stretch"
@@ -783,7 +991,7 @@
               >
                 ${state.teams.slice(0, teamCount).map((team, idx) => `
                   <div
-                    class="team-qr-card rounded-xl border-2 flex flex-col items-center justify-between p-2 bg-[#000428] text-center shadow-lg transition-all"
+                    class="team-qr-card rounded-xl border-2 flex flex-col items-center justify-between p-2 bg-[#000428] text-center shadow-lg transition-all overflow-hidden"
                     style="border-color: ${team.color};"
                   >
                     <!-- Título de Equipo Editable -->
@@ -794,23 +1002,50 @@
                           type="text"
                           data-team-index="${idx}"
                           value="${team.name}"
-                          class="team-name-input bg-transparent text-white font-black text-xs sm:text-sm text-center outline-none border-b border-transparent focus:border-[#FFCC00] max-w-[120px]"
+                          class="team-name-input bg-transparent text-white font-black text-xs sm:text-sm text-center outline-none border-b border-transparent focus:border-[#FFCC00] max-w-[130px]"
                         />
                       </div>
-                      <span class="text-[10px] text-blue-300 font-mono font-bold block">
-                        ${team.members.length} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} miembros
+                      <span class="text-[11px] font-mono font-bold block" style="color: ${team.color};">
+                        ${team.members.length} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} conectados
                       </span>
                     </div>
 
-                    <!-- Contenedor del QR (generado con qrcodejs) -->
-                    <div class="my-auto py-1 flex items-center justify-center">
+                    <!-- Código QR Dinámico -->
+                    <div class="my-auto py-1 flex items-center justify-center shrink-0">
                       <div
                         id="qrcode-box-${team.id}"
                         class="bg-white p-1.5 rounded-xl shadow-md border border-white inline-block flex items-center justify-center"
                       ></div>
                     </div>
 
-                    <!-- Enlace Rápido y Estado -->
+                    <!-- LISTA DE MIEMBROS CONECTADOS EN TIEMPO REAL -->
+                    <div class="w-full shrink-0 px-1 mb-1">
+                      <div class="text-[10px] uppercase font-black text-blue-300 tracking-wider mb-1 flex items-center justify-between">
+                        <span>Miembros:</span>
+                        <span class="text-[9px] text-emerald-400 font-bold font-mono">${team.members.length}</span>
+                      </div>
+                      <div class="flex flex-wrap gap-1 justify-center max-h-[50px] overflow-y-auto">
+                        ${team.members.length === 0 ? `
+                          <span class="text-[10px] text-blue-400/60 italic py-0.5">
+                            Esperando participante...
+                          </span>
+                        ` : team.members.map(m => `
+                          <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-900/90 text-white border border-blue-500 shadow-sm animate-in zoom-in-95">
+                            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                            <span class="truncate max-w-[70px]">${m.name}</span>
+                            <button
+                              type="button"
+                              data-team-id="${team.id}"
+                              data-member-id="${m.id}"
+                              class="btn-remove-member hover:text-rose-400 text-xs font-black ml-0.5"
+                              title="Remover participante"
+                            >×</button>
+                          </span>
+                        `).join('')}
+                      </div>
+                    </div>
+
+                    <!-- Botón de Copiar Enlace -->
                     <div class="w-full shrink-0">
                       <button
                         type="button"
@@ -838,18 +1073,16 @@
           </div>
         `;
 
-        // Generar los códigos QR con QRCode.js CDN (sin dependencias locales)
-        const baseUrl = window.location.href.split('?')[0];
+        // Generar los Códigos QR con la URL que incluye roomCode y teamId
         state.teams.slice(0, teamCount).forEach((team) => {
           const qrContainer = document.getElementById(`qrcode-box-${team.id}`);
           if (qrContainer && typeof QRCode === 'function') {
             qrContainer.innerHTML = '';
-            const playerTeamUrl = `${baseUrl}?role=player&team=${team.id}`;
-            // Tamaño adaptativo compacto para que no genere scroll
+            const playerTeamUrl = `${baseUrl}?role=player&room=${state.roomCode}&team=${team.id}`;
             new QRCode(qrContainer, {
               text: playerTeamUrl,
-              width: 100,
-              height: 100,
+              width: 95,
+              height: 95,
               colorDark: '#000533',
               colorLight: '#ffffff',
               correctLevel: QRCode.CorrectLevel.M
@@ -861,13 +1094,13 @@
         const titleInput = document.getElementById('setup-title-input');
         titleInput.addEventListener('change', () => {
           state.title = titleInput.value.trim() || 'Torneo Jeopardy';
-          persistAndBroadcast(state);
+          persistState(state);
         });
 
         const maxMemSelect = document.getElementById('setup-max-members');
         maxMemSelect.addEventListener('change', () => {
           state.maxMembersPerTeam = parseInt(maxMemSelect.value, 10);
-          persistAndBroadcast(state);
+          persistState(state);
         });
 
         document.querySelectorAll('.team-count-btn').forEach(btn => {
@@ -879,7 +1112,7 @@
               return existing ? { ...existing } : { ...t };
             });
             state.teams = updatedTeams;
-            persistAndBroadcast(state);
+            persistState(state);
           });
         });
 
@@ -888,15 +1121,23 @@
             const idx = parseInt(inp.getAttribute('data-team-index'), 10);
             if (state.teams[idx]) {
               state.teams[idx].name = inp.value.trim() || `Equipo ${idx + 1}`;
-              persistAndBroadcast(state);
+              persistState(state);
             }
+          });
+        });
+
+        document.querySelectorAll('.btn-remove-member').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const teamId = btn.getAttribute('data-team-id');
+            const memberId = btn.getAttribute('data-member-id');
+            dispatchAction('PLAYER_REMOVE', { teamId, memberId });
           });
         });
 
         document.querySelectorAll('.btn-copy-team-link').forEach(btn => {
           btn.addEventListener('click', () => {
             const teamId = btn.getAttribute('data-team-id');
-            const link = `${baseUrl}?role=player&team=${teamId}`;
+            const link = `${baseUrl}?role=player&room=${state.roomCode}&team=${teamId}`;
             navigator.clipboard.writeText(link).then(() => {
               const prev = btn.textContent;
               btn.textContent = '¡Copiado!';
@@ -905,7 +1146,7 @@
           });
         });
 
-        // Subir archivo de preguntas JSON
+        // Subida de preguntas personalizadas
         const fileInput = document.getElementById('questions-file-input');
         fileInput.addEventListener('change', (e) => {
           const file = e.target.files[0];
@@ -918,7 +1159,7 @@
                 state.categories = importedCats;
                 sound.playCorrect();
                 alert(`¡Se cargaron exitosamente ${importedCats.length} categorías!`);
-                persistAndBroadcast(state);
+                persistState(state);
               } else {
                 alert('El archivo no tiene el formato esperado de categorías.');
               }
@@ -930,10 +1171,10 @@
         });
 
         document.getElementById('btn-default-questions').addEventListener('click', () => {
-          if (confirm('¿Restaurar las 5 categorías y 25 preguntas por defecto?')) {
+          if (confirm('¿Restaurar las 5 categorías oficiales por defecto?')) {
             state.categories = JSON.parse(JSON.stringify(DEFAULT_CATEGORIES));
             sound.playSelect();
-            persistAndBroadcast(state);
+            persistState(state);
           }
         });
 
@@ -951,11 +1192,11 @@
         document.getElementById('btn-start-jeopardy-game').addEventListener('click', () => {
           sound.playSelect();
           state.status = 'playing';
-          persistAndBroadcast(state);
+          persistState(state);
         });
       }
 
-      // --- PANTALLA 3: TABLERO PRINCIPAL DE JEOPARDY ---
+      // 3. TABLERO DE JEOPARDY EN VIVO
       function renderGameScreen(container) {
         const teamCount = state.teamCount || state.teams.length;
         const activeTeams = state.teams.slice(0, teamCount);
@@ -969,12 +1210,12 @@
                   J!
                 </div>
                 <div>
-                  <h1 class="text-base sm:text-lg font-black text-white uppercase tracking-wider font-cinzel leading-none">
+                  <h1 class="text-base sm:text-lg font-black text-white uppercase tracking-wider font-cinzel leading-none flex items-center gap-2">
                     ${state.title}
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
                   </h1>
                   <span class="text-[11px] text-emerald-400 font-bold flex items-center gap-1 mt-0.5">
-                    <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                    En Vivo • GitHub Pages Autocontenido
+                    Sala: <strong class="text-[#FFCC00] font-mono">${state.roomCode}</strong> • En Vivo
                   </span>
                 </div>
               </div>
@@ -992,9 +1233,14 @@
                       style="background-color: ${t.color}22; border-color: ${isLocked ? '#475569' : t.color};"
                     >
                       <div class="text-left">
-                        <span class="text-[10px] uppercase font-black tracking-wider block" style="color: ${isLocked ? '#94a3b8' : t.color}">
-                          ${t.name} ${isLocked ? '(Bloqueado)' : ''}
-                        </span>
+                        <div class="flex items-center gap-1">
+                          <span class="text-[10px] uppercase font-black tracking-wider block" style="color: ${isLocked ? '#94a3b8' : t.color}">
+                            ${t.name}
+                          </span>
+                          <span class="text-[9px] px-1 py-0.2 rounded bg-blue-950/80 text-blue-200 font-mono">
+                            ${t.members.length}
+                          </span>
+                        </div>
                         <span class="text-sm sm:text-base font-black font-mono text-white leading-none">
                           $${t.score}
                         </span>
@@ -1018,7 +1264,7 @@
                 }).join('')}
               </div>
 
-              <!-- Controles de Navegación y Cierre de Sesión Global -->
+              <!-- Controles del Anfitrión -->
               <div class="flex items-center gap-2">
                 <button
                   id="btn-return-setup"
@@ -1029,7 +1275,7 @@
                 <button
                   id="btn-reset-board"
                   class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs uppercase border border-slate-600 cursor-pointer"
-                  title="Reiniciar casillas contestadas"
+                  title="Reiniciar casillas"
                 >
                   Reiniciar
                 </button>
@@ -1042,7 +1288,7 @@
               </div>
             </header>
 
-            <!-- Tablero de Categorías y Pistas -->
+            <!-- Tablero de Jeopardy -->
             <main class="flex-1 p-3 sm:p-5 flex flex-col justify-center max-w-7xl mx-auto w-full">
               <div
                 class="grid gap-2 sm:gap-3 flex-1"
@@ -1078,22 +1324,22 @@
               </div>
             </main>
 
-            <!-- Modal de Pista Activa (si hay pista abierta) -->
             ${state.activeClue ? renderClueModalHTML() : ''}
           </div>
         `;
 
-        // Eventos del Tablero
+        // Ajustes manuales de puntuación
         document.querySelectorAll('.btn-score-adjust').forEach(btn => {
           btn.addEventListener('click', () => {
             const teamId = btn.getAttribute('data-team-id');
             const delta = parseInt(btn.getAttribute('data-delta'), 10);
             const updated = state.teams.map(t => t.id === teamId ? { ...t, score: t.score + delta } : t);
             state.teams = updated;
-            persistAndBroadcast(state);
+            persistState(state);
           });
         });
 
+        // Selección de casilla
         document.querySelectorAll('.clue-card-btn').forEach(btn => {
           btn.addEventListener('click', () => {
             const catId = btn.getAttribute('data-category-id');
@@ -1107,7 +1353,7 @@
               ...clue,
               categoryId: cat.id,
               categoryTitle: cat.title,
-              state: 'reading' // 'reading' | 'buzzing_open' | 'buzzed' | 'revealed'
+              state: 'reading'
             };
             state.buzzerState = {
               isOpen: false,
@@ -1121,17 +1367,17 @@
               firstAttemptTeamId: null,
               hasReboundedToFirst: false
             };
-            persistAndBroadcast(state);
+            persistState(state);
           });
         });
 
         document.getElementById('btn-return-setup').addEventListener('click', () => {
           state.status = 'setup';
-          persistAndBroadcast(state);
+          persistState(state);
         });
 
         document.getElementById('btn-reset-board').addEventListener('click', () => {
-          if (confirm('¿Deseas reiniciar todas las casillas y puntuaciones del tablero?')) {
+          if (confirm('¿Deseas reiniciar las pistas contestadas del tablero?')) {
             const resetCats = state.categories.map(c => ({
               ...c,
               clues: c.clues.map(cl => ({ ...cl, isAnswered: false }))
@@ -1140,12 +1386,12 @@
             state.categories = resetCats;
             state.teams = resetTeams;
             state.activeClue = null;
-            persistAndBroadcast(state);
+            persistState(state);
           }
         });
 
         document.getElementById('btn-global-logout-game').addEventListener('click', () => {
-          if (confirm('¿Confirmas el cierre de sesión global? La pantalla se bloqueará y se desconectará a los teléfonos.')) {
+          if (confirm('¿Confirmas el cierre de sesión global? Se bloqueará la pantalla y desconectará a los teléfonos.')) {
             executeGlobalLogout();
           }
         });
@@ -1155,7 +1401,7 @@
         }
       }
 
-      // --- MODAL DE PISTA ACTIVA (REGLA DE 10 SEGUNDOS Y REBOTES) ---
+      // MODAL DE PISTA ACTIVA CON CUENTA REGRESIVA DE 10 SEGUNDOS
       function renderClueModalHTML() {
         const clue = state.activeClue;
         const b = state.buzzerState;
@@ -1164,7 +1410,6 @@
         return `
           <div class="fixed inset-0 z-40 flex items-center justify-center p-3 sm:p-6 bg-black/90 backdrop-blur-md animate-in fade-in duration-150">
             <div class="w-full max-w-4xl bg-[#000222] border-4 border-[#D4AF37] rounded-3xl p-5 sm:p-8 shadow-[0_0_60px_rgba(212,175,55,0.4)] flex flex-col justify-between min-h-[460px] max-h-[92vh] overflow-y-auto">
-              <!-- Encabezado Modal -->
               <div class="flex items-center justify-between border-b-2 border-blue-900/60 pb-3">
                 <span class="font-cinzel text-sm sm:text-base font-black text-[#FFCC00] uppercase tracking-wider">
                   ${clue.categoryTitle || 'Pista'} • $${clue.value}
@@ -1175,7 +1420,6 @@
                 >✕</button>
               </div>
 
-              <!-- Texto de la Pregunta -->
               <div class="my-6 sm:my-8 text-center px-4">
                 <h2 class="text-xl sm:text-3xl md:text-4xl font-black text-white font-cinzel tracking-wide leading-relaxed drop-shadow-md">
                   "${clue.question}"
@@ -1193,7 +1437,6 @@
                 ` : ''}
               </div>
 
-              <!-- Estados y Controles de Pulsadores y Temporizador 10s -->
               <div class="space-y-4">
                 ${clue.state === 'reading' ? `
                   <div class="text-center">
@@ -1243,7 +1486,6 @@
                       Participante: <strong class="text-[#FFCC00]">${b.buzzedPlayerName || 'Pulsador Móvil'}</strong>
                     </div>
 
-                    <!-- Cuenta Regresiva de 10 Segundos -->
                     ${b.playerAnswer ? `
                       <div class="p-2.5 rounded-xl bg-emerald-500/20 border border-emerald-400 text-emerald-300 text-xs font-bold">
                         Respuesta enviada: <span class="text-white text-sm font-black">"${b.playerAnswer}"</span>
@@ -1268,7 +1510,6 @@
                       </div>
                     `}
 
-                    <!-- Botones de Calificación del Anfitrión -->
                     <div class="grid grid-cols-2 gap-3 pt-2">
                       <button
                         id="btn-judge-correct"
@@ -1309,7 +1550,7 @@
             state.buzzerState.isOpen = true;
             state.buzzerState.buzzedTeamId = null;
             state.buzzerState.answerTimeRemaining = 10;
-            persistAndBroadcast(state);
+            persistState(state);
           });
         }
 
@@ -1346,23 +1587,23 @@
             answerTimeRemaining: 10,
             playerAnswer: null,
             lockedTeams: [],
-            firstAttemptTeamId: null
+            firstAttemptTeamId: null,
+            hasReboundedToFirst: false
           };
-          persistAndBroadcast(state);
+          persistState(state);
         };
 
         if (btnFinish) btnFinish.addEventListener('click', closeModal);
         if (btnCloseX) btnCloseX.addEventListener('click', closeModal);
       }
 
-      // --- PANTALLA 4: VISTA MÓVIL DEL JUGADOR (PULSADOR) ---
+      // 4. VISTA MÓVIL DEL JUGADOR
       function renderPlayerView(container) {
         const teamCount = state.teamCount || state.teams.length;
         const availableTeams = state.teams.slice(0, teamCount);
         let myTeamId = assignedTeamId || localStorage.getItem('jeopardy_player_team') || availableTeams[0]?.id;
         let myName = localStorage.getItem('jeopardy_player_name') || '';
 
-        // Si aún no ha ingresado nombre
         if (!myName) {
           container.innerHTML = `
             <div class="min-h-screen bg-gradient-to-b from-[#000533] via-[#020B4A] to-[#00021A] p-4 flex items-center justify-center">
@@ -1371,18 +1612,19 @@
                   J!
                 </div>
                 <div>
-                  <h2 class="text-xl font-black text-white uppercase font-cinzel">
-                    Pulsador de Concurso
+                  <h2 class="text-xl font-black text-white uppercase font-cinzel flex items-center justify-center gap-2">
+                    Pulsador Móvil
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
                   </h2>
                   <p class="text-xs text-blue-200 mt-1">
-                    Selecciona tu equipo e introduce tu nombre para unirte al juego en vivo.
+                    Sala: <strong class="text-[#FFCC00] font-mono">${roomCodeParam}</strong> • Únete a tu equipo para concursar.
                   </p>
                 </div>
 
                 <form id="player-join-form" class="space-y-4 text-left">
                   <div>
                     <label class="block text-[11px] font-black uppercase tracking-wider text-blue-200 mb-1">
-                      Tu Equipo
+                      Selecciona tu Equipo
                     </label>
                     <select
                       id="player-team-select"
@@ -1390,7 +1632,7 @@
                     >
                       ${availableTeams.map(t => `
                         <option value="${t.id}" ${t.id === myTeamId ? 'selected' : ''}>
-                          ${t.name}
+                          ${t.name} (${t.members.length} conectados)
                         </option>
                       `).join('')}
                     </select>
@@ -1398,7 +1640,7 @@
 
                   <div>
                     <label class="block text-[11px] font-black uppercase tracking-wider text-blue-200 mb-1">
-                      Nombre del Participante
+                      Tu Nombre
                     </label>
                     <input
                       id="player-name-input"
@@ -1413,7 +1655,7 @@
                     type="submit"
                     class="w-full py-3.5 rounded-xl bg-[#FFCC00] hover:bg-yellow-300 text-[#000533] font-black text-sm uppercase tracking-widest shadow-lg cursor-pointer"
                   >
-                    Entrar al Concurso
+                    Ingresar al Concurso
                   </button>
                 </form>
 
@@ -1436,24 +1678,18 @@
             localStorage.setItem('jeopardy_player_name', chosenName);
             localStorage.setItem('jeopardy_player_team', chosenTeam);
 
-            // Registrar miembro en el equipo
-            const updatedTeams = state.teams.map(t => {
-              if (t.id === chosenTeam) {
-                const existing = t.members.find(m => m.name === chosenName);
-                if (!existing) {
-                  return { ...t, members: [...t.members, { id: 'm-' + Date.now(), name: chosenName }] };
-                }
-              }
-              return t;
+            const memberId = 'm-' + Date.now();
+            dispatchAction('PLAYER_JOIN', {
+              teamId: chosenTeam,
+              memberName: chosenName,
+              memberId: memberId
             });
-            state.teams = updatedTeams;
-            persistAndBroadcast(state);
+
             render();
           });
           return;
         }
 
-        // Ya está unido: mostrar pulsador
         const myTeam = state.teams.find(t => t.id === myTeamId) || state.teams[0];
         const b = state.buzzerState;
         const isBuzzerOpen = b.isOpen;
@@ -1462,7 +1698,6 @@
 
         container.innerHTML = `
           <div class="min-h-screen bg-[#000533] flex flex-col justify-between p-4 max-w-md mx-auto">
-            <!-- Barra Superior del Participante -->
             <div class="flex items-center justify-between bg-[#000842] border-2 border-blue-800 rounded-2xl p-3 shadow-md">
               <div class="flex items-center gap-2.5">
                 <span class="w-4 h-4 rounded-full" style="background-color: ${myTeam.color};"></span>
@@ -1471,15 +1706,17 @@
                   <span class="text-[11px] text-blue-300 font-bold">${myName}</span>
                 </div>
               </div>
-              <button
-                id="btn-player-change-team"
-                class="text-[11px] text-blue-300 hover:text-white underline font-bold"
-              >
-                Cambiar
-              </button>
+              <div class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
+                <button
+                  id="btn-player-change-team"
+                  class="text-[11px] text-blue-300 hover:text-white underline font-bold"
+                >
+                  Cambiar
+                </button>
+              </div>
             </div>
 
-            <!-- Zona Central: Pulsador o Formulario de Respuesta en 10s -->
             <div class="my-auto py-6 text-center">
               ${isMyTeamBuzzed ? `
                 <div class="bg-white border-4 border-[#FFCC00] rounded-3xl p-5 shadow-[0_0_40px_rgba(255,204,0,0.6)] space-y-3 text-blue-950 animate-in zoom-in-95">
@@ -1564,20 +1801,10 @@
         if (btnBuzz && isBuzzerOpen && !isLocked) {
           btnBuzz.addEventListener('click', () => {
             sound.playBuzz();
-            state.buzzerState = {
-              ...state.buzzerState,
-              isOpen: false,
-              buzzedTeamId: myTeam.id,
-              buzzedPlayerName: myName,
-              buzzedAt: Date.now(),
-              answerTimeLimit: 10,
-              answerTimeRemaining: 10,
-              playerAnswer: null
-            };
-            if (state.activeClue) {
-              state.activeClue.state = 'buzzed';
-            }
-            persistAndBroadcast(state);
+            dispatchAction('PLAYER_BUZZ', {
+              teamId: myTeam.id,
+              memberName: myName
+            });
           });
         }
 
@@ -1588,8 +1815,10 @@
             const input = document.getElementById('player-answer-input');
             if (!input || !input.value.trim()) return;
             sound.playSelect();
-            state.buzzerState.playerAnswer = input.value.trim();
-            persistAndBroadcast(state);
+            dispatchAction('PLAYER_ANSWER', {
+              teamId: myTeam.id,
+              answer: input.value.trim()
+            });
           });
         }
       }
@@ -1614,7 +1843,7 @@
                   href="?"
                   class="block w-full py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs uppercase"
                 >
-                  Volver a la Portada
+                  Volver al Inicio
                 </a>
               </div>
             </div>
@@ -1622,7 +1851,8 @@
         `;
       }
 
-      // Iniciar renderizado al cargar la página
+      // Iniciar sincronización de red e interfaz
+      initNetworkSync();
       render();
     })();
   </script>
