@@ -1,21 +1,1630 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="es">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-    <title>Jeopardy Live Show</title>
-    <meta name="description" content="Aplicación interactiva de concurso Jeopardy para eventos y clases con pulsadores en tiempo real por QR, gestión de equipos y efectos de sonido." />
-    <meta property="og:title" content="Jeopardy Live Show" />
-    <meta property="og:description" content="Aplicación interactiva de concurso Jeopardy para eventos y clases con pulsadores en tiempo real por QR, gestión de equipos y efectos de sonido." />
-    <meta property="og:type" content="website" />
-    <meta name="twitter:card" content="summary_large_image" />
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Cinzel:wght@700;900&family=Outfit:wght@400;500;600;700;800;900&family=Teko:wght@600;700&display=swap" rel="stylesheet">
-  </head>
-  <body class="bg-[#000533] text-white antialiased selection:bg-[#FFCC00] selection:text-[#000533]">
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Jeopardy Live Show - Producción</title>
+  <meta name="description" content="Aplicación interactiva de concurso Jeopardy para eventos y clases con pulsadores en tiempo real por QR, gestión de hasta 5 equipos y efectos de sonido." />
 
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            jeopardy: {
+              blue: '#060CE9',
+              dark: '#000533',
+              gold: '#FFCC00',
+              accent: '#D4AF37'
+            }
+          }
+        }
+      }
+    };
+  </script>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800;900&family=Cinzel:wght@700;900&family=Bebas+Neue&family=Teko:wght@600;700&display=swap" rel="stylesheet">
+
+  <!-- QRCode.js CDN confiable -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+  <!-- Canvas Confetti CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
+
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Outfit', sans-serif;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      overflow-x: hidden;
+    }
+    .font-cinzel { font-family: 'Cinzel', serif; }
+    .font-bebas { font-family: 'Bebas Neue', cursive; }
+    .font-teko { font-family: 'Teko', sans-serif; }
+    
+    @keyframes pulse-fast {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.85; transform: scale(1.02); }
+    }
+    .animate-pulse-fast { animation: pulse-fast 1s infinite ease-in-out; }
+    
+    @keyframes shake {
+      0%, 100% { transform: translateX(0); }
+      20%, 60% { transform: translateX(-8px); }
+      40%, 80% { transform: translateX(8px); }
+    }
+    .animate-shake { animation: shake 0.35s ease-in-out; }
+
+    /* Custom scrollbars for clean presentation */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #000324; }
+    ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #334155; }
+  </style>
+</head>
+<body class="bg-[#000533] text-white antialiased min-h-screen selection:bg-[#FFCC00] selection:text-[#000533]">
+  <div id="app" class="min-h-screen flex flex-col"></div>
+
+  <script>
+    (function() {
+      // --- CONSTANTES Y CONFIGURACIÓN BASE ---
+      const AUTH_KEY = 'jeopardy_auth_status';
+      const STORAGE_KEY = 'jeopardy_game_store';
+      const BROADCAST_CHANNEL_NAME = 'jeopardy_global_sync_channel';
+      const PASSWORD_HASH = 'Altair16'; // Clave solicitada
+
+      // Colores oficiales para hasta 5 equipos
+      const DEFAULT_TEAMS_TEMPLATE = [
+        { id: 'team-1', name: 'Equipo Azul', color: '#2563EB', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'team-2', name: 'Equipo Rojo', color: '#DC2626', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'team-3', name: 'Equipo Verde', color: '#16A34A', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'team-4', name: 'Equipo Dorado', color: '#CA8A04', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'team-5', name: 'Equipo Morado', color: '#9333EA', textColor: '#FFFFFF', score: 0, members: [] }
+      ];
+
+      const DEFAULT_CATEGORIES = [
+        {
+          id: 'cat-1',
+          title: 'Historia',
+          clues: [
+            { id: 'c1-100', value: 100, question: 'Año de la llegada de Cristóbal Colón al continente americano.', answer: '1492', isAnswered: false },
+            { id: 'c1-200', value: 200, question: 'Civilización precolombina constructora de la ciudadela de Machu Picchu.', answer: 'Los Incas', isAnswered: false },
+            { id: 'c1-300', value: 300, question: 'Primer emperador de Roma tras la caída de la República romana.', answer: 'César Augusto', isAnswered: false },
+            { id: 'c1-400', value: 400, question: 'Tratado firmado en 1919 que selló el final de la Primera Guerra Mundial.', answer: 'Tratado de Versalles', isAnswered: false },
+            { id: 'c1-500', value: 500, question: 'Pensador de la Ilustración autor de "El espíritu de las leyes" y la división de poderes.', answer: 'Montesquieu', isAnswered: false }
+          ]
+        },
+        {
+          id: 'cat-2',
+          title: 'Ciencia',
+          clues: [
+            { id: 'c2-100', value: 100, question: 'Elemento químico más ligero y abundante del universo conocido.', answer: 'Hidrógeno', isAnswered: false },
+            { id: 'c2-200', value: 200, question: 'Fuerza que atrae los cuerpos hacia el centro de la Tierra.', answer: 'Gravedad', isAnswered: false },
+            { id: 'c2-300', value: 300, question: 'Orgánulo celular responsable directo de la respiración celular y producción de ATP.', answer: 'Mitocondria', isAnswered: false },
+            { id: 'c2-400', value: 400, question: 'Velocidad estimada de la propagación de la luz en el vacío en km/s.', answer: '300.000 km/s', isAnswered: false },
+            { id: 'c2-500', value: 500, question: 'Partícula elemental de carga neutra situada en el núcleo atómico.', answer: 'Neutrón', isAnswered: false }
+          ]
+        },
+        {
+          id: 'cat-3',
+          title: 'Geografía',
+          clues: [
+            { id: 'c3-100', value: 100, question: 'Río con mayor caudal y longitud del planeta Tierra.', answer: 'Río Amazonas', isAnswered: false },
+            { id: 'c3-200', value: 200, question: 'País soberano con mayor superficie territorial del planeta.', answer: 'Rusia', isAnswered: false },
+            { id: 'c3-300', value: 300, question: 'Cordillera continental más larga del mundo ubicada en América del Sur.', answer: 'Cordillera de los Andes', isAnswered: false },
+            { id: 'c3-400', value: 400, question: 'Ciudad capital de Australia.', answer: 'Canberra', isAnswered: false },
+            { id: 'c3-500', value: 500, question: 'Desierto no polar más árido del mundo, ubicado en el norte de Chile.', answer: 'Desierto de Atacama', isAnswered: false }
+          ]
+        },
+        {
+          id: 'cat-4',
+          title: 'Cultura Pop',
+          clues: [
+            { id: 'c4-100', value: 100, question: 'Identidad secreta del superhéroe protector de Gotham City conocido como Batman.', answer: 'Bruce Wayne', isAnswered: false },
+            { id: 'c4-200', value: 200, question: 'Banda británica icónica integrada por Lennon, McCartney, Harrison y Starr.', answer: 'The Beatles', isAnswered: false },
+            { id: 'c4-300', value: 300, question: 'Superproducción de James Cameron ambientada en la luna extraterrestre Pandora.', answer: 'Avatar', isAnswered: false },
+            { id: 'c4-400', value: 400, question: 'Criatura eléctrica y mascota representativa de la franquicia Pokémon.', answer: 'Pikachu', isAnswered: false },
+            { id: 'c4-500', value: 500, question: 'Autor británico de la célebre saga literaria "El Señor de los Anillos".', answer: 'J.R.R. Tolkien', isAnswered: false }
+          ]
+        },
+        {
+          id: 'cat-5',
+          title: 'Deportes',
+          clues: [
+            { id: 'c5-100', value: 100, question: 'País con mayor cantidad de títulos en Copas Mundiales FIFA masculinas.', answer: 'Brasil (5 títulos)', isAnswered: false },
+            { id: 'c5-200', value: 200, question: 'Puntaje máximo que se puede alcanzar en una partida estándar de boliche (bowling).', answer: '300 puntos', isAnswered: false },
+            { id: 'c5-300', value: 300, question: 'Atleta jamaiquino plusmarquista de los 100 y 200 metros planos.', answer: 'Usain Bolt', isAnswered: false },
+            { id: 'c5-400', value: 400, question: 'Torneo de tenis de Grand Slam disputado sobre césped en el Reino Unido.', answer: 'Wimbledon', isAnswered: false },
+            { id: 'c5-500', value: 500, question: 'Número reglamentario de jugadores por equipo en cancha en básquetbol.', answer: '5 jugadores', isAnswered: false }
+          ]
+        }
+      ];
+
+      // --- SINTETIZADOR DE AUDIO NATIVO (SIN ARCHIVOS EXTERNOS) ---
+      class SoundSynthesizer {
+        constructor() { this.ctx = null; }
+        init() {
+          if (!this.ctx) {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (AudioCtx) this.ctx = new AudioCtx();
+          }
+          if (this.ctx && this.ctx.state === 'suspended') {
+            this.ctx.resume();
+          }
+        }
+        playSelect() {
+          this.init(); if (!this.ctx) return;
+          const now = this.ctx.currentTime;
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(587.33, now);
+          osc.frequency.exponentialRampToValueAtTime(1174.66, now + 0.1);
+          gain.gain.setValueAtTime(0.25, now);
+          gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
+          osc.connect(gain); gain.connect(this.ctx.destination);
+          osc.start(now); osc.stop(now + 0.11);
+        }
+        playBuzz() {
+          this.init(); if (!this.ctx) return;
+          const now = this.ctx.currentTime;
+          [220, 277.18, 329.63, 440].forEach(freq => {
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(freq, now);
+            gain.gain.setValueAtTime(0.18, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.45);
+            osc.connect(gain); gain.connect(this.ctx.destination);
+            osc.start(now); osc.stop(now + 0.46);
+          });
+        }
+        playCorrect() {
+          this.init(); if (!this.ctx) return;
+          const now = this.ctx.currentTime;
+          [523.25, 659.25, 783.99, 1046.5].forEach((freq, idx) => {
+            const st = now + idx * 0.08;
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            osc.type = 'triangle';
+            osc.frequency.setValueAtTime(freq, st);
+            gain.gain.setValueAtTime(0.25, st);
+            gain.gain.exponentialRampToValueAtTime(0.001, st + 0.35);
+            osc.connect(gain); gain.connect(this.ctx.destination);
+            osc.start(st); osc.stop(st + 0.36);
+          });
+        }
+        playWrong() {
+          this.init(); if (!this.ctx) return;
+          const now = this.ctx.currentTime;
+          [146.83, 138.59].forEach(freq => {
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(freq, now);
+            gain.gain.setValueAtTime(0.3, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
+            osc.connect(gain); gain.connect(this.ctx.destination);
+            osc.start(now); osc.stop(now + 0.51);
+          });
+        }
+        playTimeUp() {
+          this.init(); if (!this.ctx) return;
+          const now = this.ctx.currentTime;
+          [0, 0.12, 0.24].forEach(d => {
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(880, now + d);
+            gain.gain.setValueAtTime(0.25, now + d);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + d + 0.09);
+            osc.connect(gain); gain.connect(this.ctx.destination);
+            osc.start(now + d); osc.stop(now + d + 0.1);
+          });
+        }
+      }
+      const sound = new SoundSynthesizer();
+
+      // --- ESTADO GLOBAL AUTOCONTENIDO ---
+      function getDefaultState() {
+        return {
+          status: 'setup', // 'setup' | 'playing'
+          title: 'Torneo Jeopardy Live Show',
+          categories: JSON.parse(JSON.stringify(DEFAULT_CATEGORIES)),
+          teamCount: 3,
+          maxMembersPerTeam: 5,
+          teams: JSON.parse(JSON.stringify(DEFAULT_TEAMS_TEMPLATE.slice(0, 3))),
+          activeClue: null,
+          buzzerState: {
+            isOpen: false,
+            buzzedTeamId: null,
+            buzzedPlayerName: null,
+            buzzedAt: null,
+            answerTimeLimit: 10,
+            answerTimeRemaining: 10,
+            playerAnswer: null,
+            lockedTeams: [], // Equipos bloqueados en esta pista por fallo
+            firstAttemptTeamId: null, // Primer equipo que falló
+            buzzOrderQueue: [] // Cola de turnos
+          },
+          settings: {
+            penalizeWrong: true,
+            allowReboundToFirstAfterAllFail: true
+          },
+          lastLogoutTimestamp: 0
+        };
+      }
+
+      function loadState() {
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            return parsed;
+          }
+        } catch (e) {}
+        return getDefaultState();
+      }
+
+      let state = loadState();
+      let isAuthenticated = sessionStorage.getItem(AUTH_KEY) === 'true';
+
+      // Parámetros de URL para distinguir móvil (jugador) vs host
+      const urlParams = new URLSearchParams(window.location.search);
+      let currentRole = urlParams.get('role') === 'player' ? 'player' : 'host';
+      let assignedTeamId = urlParams.get('team') || null;
+
+      // BroadcastChannel para sincronizar entre ventanas y dispositivos
+      let bc = null;
+      try {
+        if ('BroadcastChannel' in window) {
+          bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+          bc.onmessage = (evt) => {
+            if (!evt.data) return;
+            if (evt.data.type === 'STATE_UPDATE') {
+              state = evt.data.state;
+              render();
+            } else if (evt.data.type === 'GLOBAL_LOGOUT') {
+              handleIncomingGlobalLogout();
+            }
+          };
+        }
+      } catch (e) {}
+
+      window.addEventListener('storage', (e) => {
+        if (e.key === STORAGE_KEY && e.newValue) {
+          try {
+            state = JSON.parse(e.newValue);
+            render();
+          } catch (err) {}
+        } else if (e.key === 'jeopardy_global_logout_ts') {
+          handleIncomingGlobalLogout();
+        }
+      });
+
+      function persistAndBroadcast(newState) {
+        state = newState;
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          if (bc) bc.postMessage({ type: 'STATE_UPDATE', state });
+        } catch (e) {}
+        render();
+      }
+
+      function handleIncomingGlobalLogout() {
+        isAuthenticated = false;
+        sessionStorage.removeItem(AUTH_KEY);
+        if (currentRole === 'player') {
+          localStorage.removeItem('jeopardy_player_name');
+          renderPlayerLoggedOutNotice();
+        } else {
+          render();
+        }
+      }
+
+      // Temporizador autoritativo de 10 segundos
+      let timerInterval = null;
+      function setupAnswerTimer() {
+        if (timerInterval) clearInterval(timerInterval);
+
+        if (currentRole !== 'host') return;
+        if (!state.activeClue || state.activeClue.state !== 'buzzed' || !state.buzzerState.buzzedTeamId) {
+          return;
+        }
+
+        timerInterval = setInterval(() => {
+          if (!state.activeClue || state.activeClue.state !== 'buzzed' || !state.buzzerState.buzzedTeamId) {
+            clearInterval(timerInterval);
+            return;
+          }
+
+          if (state.buzzerState.playerAnswer) {
+            // Ya envió respuesta antes de los 10 segundos
+            return;
+          }
+
+          const currentRem = state.buzzerState.answerTimeRemaining ?? 10;
+          if (currentRem <= 1) {
+            clearInterval(timerInterval);
+            sound.playTimeUp();
+            sound.playWrong();
+            handleTeamFailedAnswer(state.buzzerState.buzzedTeamId, true);
+          } else {
+            const nextB = { ...state.buzzerState, answerTimeRemaining: currentRem - 1 };
+            state.buzzerState = nextB;
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+              if (bc) bc.postMessage({ type: 'STATE_UPDATE', state });
+            } catch (e) {}
+            render();
+          }
+        }, 1000);
+      }
+
+      // LÓGICA ESTRICTA DE TURNOS Y REBOTES:
+      // Si un participante falla, su equipo queda bloqueado temporalmente.
+      // El turno rebota al siguiente equipo en orden.
+      // La oportunidad de reintentar la pista solo regresa al primer equipo una vez que
+      // todos los demás equipos participantes hayan tenido su turno y fallado.
+      function handleTeamFailedAnswer(failedTeamId, isTimeout = false) {
+        sound.playWrong();
+        const b = state.buzzerState;
+        const clue = state.activeClue;
+
+        let nextLocked = [...(b.lockedTeams || [])];
+        if (!nextLocked.includes(failedTeamId)) {
+          nextLocked.push(failedTeamId);
+        }
+
+        // Registrar quién fue el primer equipo en fallar
+        const firstTeam = b.firstAttemptTeamId || failedTeamId;
+
+        // Descontar puntos al equipo que falló si está activa la penalización
+        const updatedTeams = state.teams.map(t => {
+          if (t.id === failedTeamId && state.settings.penalizeWrong) {
+            return { ...t, score: t.score - clue.value };
+          }
+          return t;
+        });
+
+        // Equipos activos del concurso que aún no han tenido su turno en esta pista
+        const allParticipatingTeamIds = updatedTeams.map(t => t.id);
+        const unattemptedTeams = allParticipatingTeamIds.filter(id => !nextLocked.includes(id));
+
+        let nextState = { ...state, teams: updatedTeams };
+
+        if (unattemptedTeams.length > 0) {
+          // Rebota a los equipos restantes no bloqueados abriendo el pulsador para ellos
+          nextState.activeClue = { ...clue, state: 'buzzing_open' };
+          nextState.buzzerState = {
+            ...b,
+            isOpen: true,
+            buzzedTeamId: null,
+            buzzedPlayerName: null,
+            buzzedAt: null,
+            answerTimeLimit: 10,
+            answerTimeRemaining: 10,
+            playerAnswer: null,
+            lockedTeams: nextLocked,
+            firstAttemptTeamId: firstTeam
+          };
+        } else {
+          // TODOS los demás equipos han tenido su turno y han fallado
+          if (state.settings.allowReboundToFirstAfterAllFail && allParticipatingTeamIds.length > 1) {
+            // Regla solicitada: La oportunidad de reintentar la pista SOLO regresa al primer equipo
+            // una vez que todos los demás equipos participantes hayan tenido su turno y fallado.
+            // Desbloqueamos únicamente al primer equipo para su segundo y definitivo intento,
+            // o si ya fue el segundo intento, se cierra la pista.
+            if (b.hasReboundedToFirst) {
+              // Ya tuvo su segundo intento también; se agotan los intentos y se revela la respuesta
+              nextState = closeAndRevealClue(nextState);
+            } else {
+              // Se le da la oportunidad de reintentar al primer equipo
+              const firstTeamObj = updatedTeams.find(t => t.id === firstTeam);
+              const otherTeams = allParticipatingTeamIds.filter(id => id !== firstTeam);
+              nextState.activeClue = { ...clue, state: 'buzzing_open' };
+              nextState.buzzerState = {
+                ...b,
+                isOpen: true,
+                buzzedTeamId: null,
+                buzzedPlayerName: null,
+                buzzedAt: null,
+                answerTimeLimit: 10,
+                answerTimeRemaining: 10,
+                playerAnswer: null,
+                lockedTeams: otherTeams, // Solo el primer equipo queda habilitado
+                firstAttemptTeamId: firstTeam,
+                hasReboundedToFirst: true
+              };
+            }
+          } else {
+            // Todos fallaron y no hay más reintentos
+            nextState = closeAndRevealClue(nextState);
+          }
+        }
+
+        persistAndBroadcast(nextState);
+      }
+
+      function closeAndRevealClue(targetState) {
+        const clue = targetState.activeClue;
+        const nextCats = targetState.categories.map(cat => ({
+          ...cat,
+          clues: cat.clues.map(c => c.id === clue.id ? { ...c, isAnswered: true } : c)
+        }));
+        return {
+          ...targetState,
+          categories: nextCats,
+          activeClue: { ...clue, state: 'revealed' },
+          buzzerState: {
+            ...targetState.buzzerState,
+            isOpen: false,
+            buzzedTeamId: null,
+            buzzedPlayerName: null,
+            playerAnswer: null,
+            answerTimeRemaining: 0
+          }
+        };
+      }
+
+      function handleTeamCorrectAnswer() {
+        sound.playCorrect();
+        if (typeof confetti === 'function') {
+          confetti({ particleCount: 90, spread: 75, origin: { y: 0.6 } });
+        }
+        const clue = state.activeClue;
+        const b = state.buzzerState;
+        const winningTeamId = b.buzzedTeamId;
+
+        const updatedTeams = state.teams.map(t => {
+          if (t.id === winningTeamId) {
+            return { ...t, score: t.score + clue.value };
+          }
+          return t;
+        });
+
+        const nextCats = state.categories.map(cat => ({
+          ...cat,
+          clues: cat.clues.map(c => c.id === clue.id ? { ...c, isAnswered: true } : c)
+        }));
+
+        const nextState = {
+          ...state,
+          teams: updatedTeams,
+          categories: nextCats,
+          activeClue: { ...clue, state: 'revealed' },
+          buzzerState: {
+            ...b,
+            isOpen: false,
+            answerTimeRemaining: 0
+          }
+        };
+        persistAndBroadcast(nextState);
+      }
+
+      // CIERRE DE SESIÓN GLOBAL (Requisito 6)
+      function executeGlobalLogout() {
+        sound.playSelect();
+        isAuthenticated = false;
+        sessionStorage.removeItem(AUTH_KEY);
+        const logoutTimestamp = Date.now();
+        state.lastLogoutTimestamp = logoutTimestamp;
+
+        try {
+          localStorage.setItem('jeopardy_global_logout_ts', logoutTimestamp.toString());
+          localStorage.removeItem('jeopardy_player_name');
+          if (bc) {
+            bc.postMessage({ type: 'GLOBAL_LOGOUT', timestamp: logoutTimestamp });
+          }
+        } catch (e) {}
+
+        persistAndBroadcast(state);
+      }
+
+      // --- RENDERING ROUTER ---
+      function render() {
+        const app = document.getElementById('app');
+        if (!app) return;
+
+        setupAnswerTimer();
+
+        // 1. Vista para dispositivos móviles (Jugadores)
+        if (currentRole === 'player') {
+          renderPlayerView(app);
+          return;
+        }
+
+        // 2. Pantalla de Autenticación Inicial (Requisito 2: Clave Altair16)
+        if (!isAuthenticated) {
+          renderAuthScreen(app);
+          return;
+        }
+
+        // 3. Pantalla de Configuración Inicial (Requisito 3 y 4: hasta 5 equipos y QR dinámicos)
+        if (state.status === 'setup') {
+          renderSetupScreen(app);
+          return;
+        }
+
+        // 4. Pantalla Principal de Juego (Tablero Jeopardy + Modal de Pista)
+        renderGameScreen(app);
+      }
+
+      // --- PANTALLA 1: AUTENTICACIÓN OBLIGATORIA (Altair16) ---
+      function renderAuthScreen(container) {
+        container.innerHTML = `
+          <div class="min-h-screen flex items-center justify-center p-4 bg-gradient-to-b from-[#000533] via-[#020B4A] to-[#00021A]">
+            <div class="w-full max-w-md bg-[#000842] border-4 border-[#D4AF37] rounded-3xl p-6 sm:p-8 shadow-[0_0_60px_rgba(212,175,55,0.4)] text-center space-y-6 animate-in zoom-in-95">
+              <div class="w-20 h-20 mx-auto rounded-2xl bg-[#060CE9] border-2 border-[#FFCC00] flex items-center justify-center shadow-lg transform -rotate-3 hover:rotate-0 transition-transform">
+                <span class="font-cinzel text-4xl font-black text-[#FFCC00]">J!</span>
+              </div>
+              
+              <div>
+                <h1 class="text-2xl sm:text-3xl font-black tracking-wider text-white uppercase font-cinzel">
+                  Acceso de Anfitrión
+                </h1>
+                <p class="text-xs sm:text-sm text-blue-200 mt-2">
+                  Ingresa la contraseña obligatoria del sistema para desbloquear el tablero y la configuración.
+                </p>
+              </div>
+
+              <form id="auth-form" class="space-y-4">
+                <div class="relative">
+                  <input
+                    id="auth-password"
+                    type="password"
+                    placeholder="Introduce la contraseña..."
+                    autocomplete="current-password"
+                    class="w-full py-3.5 px-4 pr-12 rounded-xl bg-[#000324] border-2 border-blue-500/70 text-white font-bold text-center tracking-widest placeholder-blue-400/50 outline-none focus:border-[#FFCC00] transition-all"
+                    required
+                    autofocus
+                  />
+                  <button
+                    type="button"
+                    id="toggle-password-btn"
+                    class="absolute right-3.5 top-1/2 -translate-y-1/2 text-blue-300 hover:text-[#FFCC00] text-xs font-bold uppercase transition-colors"
+                  >
+                    Ver
+                  </button>
+                </div>
+
+                <div id="auth-error-msg" class="hidden text-xs font-bold text-rose-300 bg-rose-950/70 py-2.5 px-3 rounded-xl border border-rose-500 animate-shake">
+                  Contraseña incorrecta. Se requiere la clave de anfitrión.
+                </div>
+
+                <button
+                  type="submit"
+                  class="w-full py-3.5 rounded-xl bg-gradient-to-r from-[#D4AF37] via-[#FFCC00] to-[#D4AF37] text-[#000533] font-black text-sm uppercase tracking-widest hover:brightness-110 active:scale-98 transition-all shadow-[0_0_20px_rgba(255,204,0,0.4)] border-2 border-white cursor-pointer"
+                >
+                  Desbloquear Sistema
+                </button>
+              </form>
+
+              <div class="pt-2 border-t border-blue-900/60 flex items-center justify-between text-xs text-blue-300">
+                <span>Versión GitHub Pages 100% Autocontenida</span>
+                <a href="?role=player" class="text-[#FFCC00] hover:underline font-bold">
+                  Modo Jugador
+                </a>
+              </div>
+            </div>
+          </div>
+        `;
+
+        const form = document.getElementById('auth-form');
+        const passInput = document.getElementById('auth-password');
+        const toggleBtn = document.getElementById('toggle-password-btn');
+        const errorMsg = document.getElementById('auth-error-msg');
+
+        toggleBtn.addEventListener('click', () => {
+          if (passInput.type === 'password') {
+            passInput.type = 'text';
+            toggleBtn.textContent = 'Ocultar';
+          } else {
+            passInput.type = 'password';
+            toggleBtn.textContent = 'Ver';
+          }
+        });
+
+        passInput.addEventListener('input', () => {
+          errorMsg.classList.add('hidden');
+        });
+
+        form.addEventListener('submit', (e) => {
+          e.preventDefault();
+          sound.init();
+          const val = passInput.value.trim();
+
+          if (val === PASSWORD_HASH) {
+            sound.playCorrect();
+            isAuthenticated = true;
+            sessionStorage.setItem(AUTH_KEY, 'true');
+            render();
+          } else {
+            sound.playWrong();
+            errorMsg.classList.remove('hidden');
+            passInput.classList.add('animate-shake');
+            setTimeout(() => passInput.classList.remove('animate-shake'), 400);
+          }
+        });
+      }
+
+      // --- PANTALLA 2: CONFIGURACIÓN INICIAL (HASTA 5 EQUIPOS + QR COMPLETOS SIN SCROLL) ---
+      function renderSetupScreen(container) {
+        const teamCount = state.teamCount || state.teams.length;
+
+        container.innerHTML = `
+          <div class="h-screen flex flex-col bg-[#000533] p-3 overflow-hidden">
+            <!-- Header Compacto -->
+            <header class="flex items-center justify-between bg-[#000222] border-2 border-[#D4AF37] rounded-2xl px-4 py-2 mb-2 shadow-md shrink-0">
+              <div class="flex items-center gap-3">
+                <div class="w-9 h-9 rounded-xl bg-[#060CE9] border-2 border-[#FFCC00] flex items-center justify-center font-cinzel text-xl font-black text-[#FFCC00]">
+                  J!
+                </div>
+                <div>
+                  <h1 class="text-base font-black text-white uppercase font-cinzel leading-none">
+                    Configuración del Torneo
+                  </h1>
+                  <span class="text-[11px] text-blue-200">
+                    Ajusta título, equipos (1 a 5), sube preguntas y genera códigos QR dinámicos.
+                  </span>
+                </div>
+              </div>
+              <div class="flex items-center gap-2">
+                <button
+                  id="btn-switch-player-view"
+                  class="px-3 py-1.5 rounded-xl bg-blue-900/70 hover:bg-blue-800 text-blue-200 font-bold text-xs uppercase border border-blue-700 cursor-pointer"
+                >
+                  Vista Jugador
+                </button>
+                <button
+                  id="btn-global-logout-setup"
+                  class="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-black text-xs uppercase border border-rose-400 cursor-pointer shadow"
+                >
+                  Cerrar Sesión Global
+                </button>
+              </div>
+            </header>
+
+            <!-- Panel de Controles Superiores Compacto -->
+            <div class="bg-[#000842] border-2 border-blue-900/80 rounded-2xl p-3 mb-2 shrink-0 grid grid-cols-1 md:grid-cols-4 gap-3 items-center text-xs">
+              <div>
+                <label class="block font-black uppercase tracking-wider text-blue-200 mb-1 text-[11px]">
+                  Título del Concurso
+                </label>
+                <input
+                  id="setup-title-input"
+                  type="text"
+                  value="${state.title}"
+                  class="w-full py-1.5 px-2.5 rounded-lg bg-[#000324] border border-blue-600 text-white font-bold outline-none focus:border-[#FFCC00]"
+                />
+              </div>
+
+              <div>
+                <label class="block font-black uppercase tracking-wider text-blue-200 mb-1 text-[11px]">
+                  Equipos Participantes (1 a 5)
+                </label>
+                <div class="grid grid-cols-5 gap-1">
+                  ${[1, 2, 3, 4, 5].map(n => `
+                    <button
+                      type="button"
+                      data-count="${n}"
+                      class="team-count-btn py-1 rounded-lg font-black text-xs uppercase border transition-all cursor-pointer ${
+                        teamCount === n
+                          ? 'bg-[#FFCC00] text-[#000533] border-white shadow'
+                          : 'bg-blue-950/70 text-blue-200 border-blue-800 hover:bg-blue-900'
+                      }"
+                    >
+                      ${n}
+                    </button>
+                  `).join('')}
+                </div>
+              </div>
+
+              <div>
+                <label class="block font-black uppercase tracking-wider text-blue-200 mb-1 text-[11px]">
+                  Límite Miembros / Equipo
+                </label>
+                <select
+                  id="setup-max-members"
+                  class="w-full py-1.5 px-2 rounded-lg bg-[#000324] border border-blue-600 text-white font-bold outline-none focus:border-[#FFCC00]"
+                >
+                  <option value="1" ${state.maxMembersPerTeam === 1 ? 'selected' : ''}>1 Persona (Individual)</option>
+                  <option value="3" ${state.maxMembersPerTeam === 3 ? 'selected' : ''}>3 Personas</option>
+                  <option value="5" ${state.maxMembersPerTeam === 5 ? 'selected' : ''}>5 Personas</option>
+                  <option value="10" ${state.maxMembersPerTeam === 10 ? 'selected' : ''}>10 Personas</option>
+                  <option value="999" ${state.maxMembersPerTeam >= 999 ? 'selected' : ''}>Sin límite</option>
+                </select>
+              </div>
+
+              <div class="flex items-end gap-2">
+                <label class="flex-1 cursor-pointer">
+                  <span class="block font-black uppercase tracking-wider text-blue-200 mb-1 text-[11px]">
+                    Subir Preguntas (JSON)
+                  </span>
+                  <span class="block text-center py-1.5 px-2 rounded-lg bg-blue-900/80 hover:bg-blue-800 border border-blue-600 font-bold text-white text-[11px] truncate">
+                    Examinar archivo
+                  </span>
+                  <input id="questions-file-input" type="file" accept=".json" class="hidden" />
+                </label>
+                <button
+                  id="btn-default-questions"
+                  type="button"
+                  title="Restaurar preguntas por defecto"
+                  class="py-1.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600 font-bold text-[11px] cursor-pointer"
+                >
+                  Por Defecto
+                </button>
+              </div>
+            </div>
+
+            <!-- ZONA DE CÓDIGOS QR DINÁMICOS COMPLETOS Y SIN SCROLL (Hasta 5 Equipos) -->
+            <!-- flex-1 y overflow-hidden para asegurar que se vean al 100% sin barra de desplazamiento vertical -->
+            <div class="flex-1 bg-[#000222] border-2 border-blue-900/60 rounded-2xl p-2.5 flex flex-col justify-between overflow-hidden shadow-inner">
+              <div class="flex items-center justify-between pb-1.5 border-b border-blue-900/80 shrink-0">
+                <span class="text-xs font-black uppercase tracking-wider text-[#FFCC00]">
+                  Códigos QR Dinámicos por Equipo (Muestra Simultánea en Pantalla)
+                </span>
+                <span class="text-[11px] text-blue-300">
+                  Escanea para unirse directamente con pulsador sincronizado
+                </span>
+              </div>
+
+              <!-- Rejilla que acomoda de 1 a 5 equipos sin scroll vertical -->
+              <div
+                id="qr-cards-grid"
+                class="grid gap-2 my-1.5 flex-1 items-stretch"
+                style="grid-template-columns: repeat(${teamCount}, minmax(0, 1fr));"
+              >
+                ${state.teams.slice(0, teamCount).map((team, idx) => `
+                  <div
+                    class="team-qr-card rounded-xl border-2 flex flex-col items-center justify-between p-2 bg-[#000428] text-center shadow-lg transition-all"
+                    style="border-color: ${team.color};"
+                  >
+                    <!-- Título de Equipo Editable -->
+                    <div class="w-full shrink-0">
+                      <div class="flex items-center justify-center gap-1 mb-0.5">
+                        <span class="w-2.5 h-2.5 rounded-full" style="background-color: ${team.color};"></span>
+                        <input
+                          type="text"
+                          data-team-index="${idx}"
+                          value="${team.name}"
+                          class="team-name-input bg-transparent text-white font-black text-xs sm:text-sm text-center outline-none border-b border-transparent focus:border-[#FFCC00] max-w-[120px]"
+                        />
+                      </div>
+                      <span class="text-[10px] text-blue-300 font-mono font-bold block">
+                        ${team.members.length} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} miembros
+                      </span>
+                    </div>
+
+                    <!-- Contenedor del QR (generado con qrcodejs) -->
+                    <div class="my-auto py-1 flex items-center justify-center">
+                      <div
+                        id="qrcode-box-${team.id}"
+                        class="bg-white p-1.5 rounded-xl shadow-md border border-white inline-block flex items-center justify-center"
+                      ></div>
+                    </div>
+
+                    <!-- Enlace Rápido y Estado -->
+                    <div class="w-full shrink-0">
+                      <button
+                        type="button"
+                        data-team-id="${team.id}"
+                        class="btn-copy-team-link w-full py-1 rounded bg-blue-950 hover:bg-blue-900 border border-blue-700 text-blue-200 font-bold text-[10px] uppercase cursor-pointer"
+                      >
+                        Copiar Enlace
+                      </button>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+
+              <!-- Botón Gigante de Inicio de Juego -->
+              <div class="shrink-0 pt-1">
+                <button
+                  id="btn-start-jeopardy-game"
+                  type="button"
+                  class="w-full py-3 sm:py-3.5 rounded-xl bg-gradient-to-r from-[#D4AF37] via-[#FFCC00] to-[#D4AF37] text-[#000533] font-black text-sm sm:text-base uppercase tracking-widest hover:brightness-110 active:scale-98 transition-all shadow-[0_0_30px_rgba(255,204,0,0.5)] border-2 border-white cursor-pointer"
+                >
+                  ¡Iniciar Tablero de Juego Jeopardy!
+                </button>
+              </div>
+            </div>
+          </div>
+        `;
+
+        // Generar los códigos QR con QRCode.js CDN (sin dependencias locales)
+        const baseUrl = window.location.href.split('?')[0];
+        state.teams.slice(0, teamCount).forEach((team) => {
+          const qrContainer = document.getElementById(`qrcode-box-${team.id}`);
+          if (qrContainer && typeof QRCode === 'function') {
+            qrContainer.innerHTML = '';
+            const playerTeamUrl = `${baseUrl}?role=player&team=${team.id}`;
+            // Tamaño adaptativo compacto para que no genere scroll
+            new QRCode(qrContainer, {
+              text: playerTeamUrl,
+              width: 100,
+              height: 100,
+              colorDark: '#000533',
+              colorLight: '#ffffff',
+              correctLevel: QRCode.CorrectLevel.M
+            });
+          }
+        });
+
+        // Eventos
+        const titleInput = document.getElementById('setup-title-input');
+        titleInput.addEventListener('change', () => {
+          state.title = titleInput.value.trim() || 'Torneo Jeopardy';
+          persistAndBroadcast(state);
+        });
+
+        const maxMemSelect = document.getElementById('setup-max-members');
+        maxMemSelect.addEventListener('change', () => {
+          state.maxMembersPerTeam = parseInt(maxMemSelect.value, 10);
+          persistAndBroadcast(state);
+        });
+
+        document.querySelectorAll('.team-count-btn').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const count = parseInt(btn.getAttribute('data-count'), 10);
+            state.teamCount = count;
+            const updatedTeams = DEFAULT_TEAMS_TEMPLATE.slice(0, count).map(t => {
+              const existing = state.teams.find(et => et.id === t.id);
+              return existing ? { ...existing } : { ...t };
+            });
+            state.teams = updatedTeams;
+            persistAndBroadcast(state);
+          });
+        });
+
+        document.querySelectorAll('.team-name-input').forEach(inp => {
+          inp.addEventListener('change', () => {
+            const idx = parseInt(inp.getAttribute('data-team-index'), 10);
+            if (state.teams[idx]) {
+              state.teams[idx].name = inp.value.trim() || `Equipo ${idx + 1}`;
+              persistAndBroadcast(state);
+            }
+          });
+        });
+
+        document.querySelectorAll('.btn-copy-team-link').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const teamId = btn.getAttribute('data-team-id');
+            const link = `${baseUrl}?role=player&team=${teamId}`;
+            navigator.clipboard.writeText(link).then(() => {
+              const prev = btn.textContent;
+              btn.textContent = '¡Copiado!';
+              setTimeout(() => { btn.textContent = prev; }, 1500);
+            });
+          });
+        });
+
+        // Subir archivo de preguntas JSON
+        const fileInput = document.getElementById('questions-file-input');
+        fileInput.addEventListener('change', (e) => {
+          const file = e.target.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = (evt) => {
+            try {
+              const importedCats = JSON.parse(evt.target.result);
+              if (Array.isArray(importedCats) && importedCats.length > 0) {
+                state.categories = importedCats;
+                sound.playCorrect();
+                alert(`¡Se cargaron exitosamente ${importedCats.length} categorías!`);
+                persistAndBroadcast(state);
+              } else {
+                alert('El archivo no tiene el formato esperado de categorías.');
+              }
+            } catch (err) {
+              alert('Error al leer el archivo JSON: ' + err.message);
+            }
+          };
+          reader.readAsText(file);
+        });
+
+        document.getElementById('btn-default-questions').addEventListener('click', () => {
+          if (confirm('¿Restaurar las 5 categorías y 25 preguntas por defecto?')) {
+            state.categories = JSON.parse(JSON.stringify(DEFAULT_CATEGORIES));
+            sound.playSelect();
+            persistAndBroadcast(state);
+          }
+        });
+
+        document.getElementById('btn-switch-player-view').addEventListener('click', () => {
+          currentRole = 'player';
+          render();
+        });
+
+        document.getElementById('btn-global-logout-setup').addEventListener('click', () => {
+          if (confirm('¿Cerrar sesión global? Se bloqueará la pantalla y se expulsará a los dispositivos móviles.')) {
+            executeGlobalLogout();
+          }
+        });
+
+        document.getElementById('btn-start-jeopardy-game').addEventListener('click', () => {
+          sound.playSelect();
+          state.status = 'playing';
+          persistAndBroadcast(state);
+        });
+      }
+
+      // --- PANTALLA 3: TABLERO PRINCIPAL DE JEOPARDY ---
+      function renderGameScreen(container) {
+        const teamCount = state.teamCount || state.teams.length;
+        const activeTeams = state.teams.slice(0, teamCount);
+
+        container.innerHTML = `
+          <div class="min-h-screen flex flex-col bg-[#000533]">
+            <!-- Header Superior -->
+            <header class="bg-[#000222] border-b-2 border-[#D4AF37] px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 sticky top-0 z-30 shadow-lg shrink-0">
+              <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-xl bg-[#060CE9] border-2 border-[#FFCC00] flex items-center justify-center font-cinzel font-black text-[#FFCC00] text-xl shadow">
+                  J!
+                </div>
+                <div>
+                  <h1 class="text-base sm:text-lg font-black text-white uppercase tracking-wider font-cinzel leading-none">
+                    ${state.title}
+                  </h1>
+                  <span class="text-[11px] text-emerald-400 font-bold flex items-center gap-1 mt-0.5">
+                    <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                    En Vivo • GitHub Pages Autocontenido
+                  </span>
+                </div>
+              </div>
+
+              <!-- Marcadores de Equipos (Hasta 5) -->
+              <div class="flex flex-wrap items-center gap-2">
+                ${activeTeams.map(t => {
+                  const isBuzzed = state.buzzerState.buzzedTeamId === t.id;
+                  const isLocked = (state.buzzerState.lockedTeams || []).includes(t.id);
+                  return `
+                    <div
+                      class="flex items-center gap-2 px-3 py-1.5 rounded-xl border-2 shadow-sm transition-all ${
+                        isBuzzed ? 'ring-2 ring-yellow-400 animate-pulse' : ''
+                      }"
+                      style="background-color: ${t.color}22; border-color: ${isLocked ? '#475569' : t.color};"
+                    >
+                      <div class="text-left">
+                        <span class="text-[10px] uppercase font-black tracking-wider block" style="color: ${isLocked ? '#94a3b8' : t.color}">
+                          ${t.name} ${isLocked ? '(Bloqueado)' : ''}
+                        </span>
+                        <span class="text-sm sm:text-base font-black font-mono text-white leading-none">
+                          $${t.score}
+                        </span>
+                      </div>
+                      <div class="flex flex-col gap-0.5 ml-1">
+                        <button
+                          data-team-id="${t.id}"
+                          data-delta="100"
+                          class="btn-score-adjust w-4 h-4 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-black text-[9px] flex items-center justify-center cursor-pointer"
+                          title="Sumar 100"
+                        >+</button>
+                        <button
+                          data-team-id="${t.id}"
+                          data-delta="-100"
+                          class="btn-score-adjust w-4 h-4 rounded bg-rose-600 hover:bg-rose-500 text-white font-black text-[9px] flex items-center justify-center cursor-pointer"
+                          title="Restar 100"
+                        >-</button>
+                      </div>
+                    </div>
+                  `;
+                }).join('')}
+              </div>
+
+              <!-- Controles de Navegación y Cierre de Sesión Global -->
+              <div class="flex items-center gap-2">
+                <button
+                  id="btn-return-setup"
+                  class="px-3 py-1.5 rounded-xl bg-blue-900/80 hover:bg-blue-800 text-blue-200 font-bold text-xs uppercase border border-blue-700 cursor-pointer"
+                >
+                  Configuración
+                </button>
+                <button
+                  id="btn-reset-board"
+                  class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs uppercase border border-slate-600 cursor-pointer"
+                  title="Reiniciar casillas contestadas"
+                >
+                  Reiniciar
+                </button>
+                <button
+                  id="btn-global-logout-game"
+                  class="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-black text-xs uppercase border border-rose-400 cursor-pointer shadow-[0_0_15px_rgba(244,63,94,0.4)]"
+                >
+                  Cerrar Sesión Global
+                </button>
+              </div>
+            </header>
+
+            <!-- Tablero de Categorías y Pistas -->
+            <main class="flex-1 p-3 sm:p-5 flex flex-col justify-center max-w-7xl mx-auto w-full">
+              <div
+                class="grid gap-2 sm:gap-3 flex-1"
+                style="grid-template-columns: repeat(${state.categories.length}, minmax(0, 1fr));"
+              >
+                ${state.categories.map(cat => `
+                  <div class="flex flex-col gap-2 sm:gap-3">
+                    <div class="h-14 sm:h-20 bg-[#060CE9] border-2 sm:border-4 border-[#D4AF37] rounded-xl flex items-center justify-center p-2 text-center shadow-lg">
+                      <span class="font-cinzel text-xs sm:text-base font-black text-[#FFCC00] uppercase tracking-wider line-clamp-2">
+                        ${cat.title}
+                      </span>
+                    </div>
+
+                    ${cat.clues.map(clue => {
+                      const isAnswered = clue.isAnswered;
+                      return `
+                        <button
+                          data-category-id="${cat.id}"
+                          data-clue-id="${clue.id}"
+                          ${isAnswered ? 'disabled' : ''}
+                          class="clue-card-btn flex-1 min-h-[50px] sm:min-h-[75px] rounded-xl border-2 sm:border-3 flex items-center justify-center font-bebas text-2xl sm:text-4xl transition-all cursor-pointer ${
+                            isAnswered
+                              ? 'bg-[#00021F] border-blue-950 text-blue-950/40 cursor-not-allowed'
+                              : 'bg-[#060CE9] hover:bg-[#0b13ff] border-[#D4AF37] text-[#FFCC00] hover:scale-102 hover:shadow-[0_0_20px_rgba(255,204,0,0.5)] active:scale-98'
+                          }"
+                        >
+                          ${isAnswered ? '' : `$${clue.value}`}
+                        </button>
+                      `;
+                    }).join('')}
+                  </div>
+                `).join('')}
+              </div>
+            </main>
+
+            <!-- Modal de Pista Activa (si hay pista abierta) -->
+            ${state.activeClue ? renderClueModalHTML() : ''}
+          </div>
+        `;
+
+        // Eventos del Tablero
+        document.querySelectorAll('.btn-score-adjust').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const teamId = btn.getAttribute('data-team-id');
+            const delta = parseInt(btn.getAttribute('data-delta'), 10);
+            const updated = state.teams.map(t => t.id === teamId ? { ...t, score: t.score + delta } : t);
+            state.teams = updated;
+            persistAndBroadcast(state);
+          });
+        });
+
+        document.querySelectorAll('.clue-card-btn').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const catId = btn.getAttribute('data-category-id');
+            const clueId = btn.getAttribute('data-clue-id');
+            const cat = state.categories.find(c => c.id === catId);
+            const clue = cat ? cat.clues.find(cl => cl.id === clueId) : null;
+            if (!clue || clue.isAnswered) return;
+
+            sound.playSelect();
+            state.activeClue = {
+              ...clue,
+              categoryId: cat.id,
+              categoryTitle: cat.title,
+              state: 'reading' // 'reading' | 'buzzing_open' | 'buzzed' | 'revealed'
+            };
+            state.buzzerState = {
+              isOpen: false,
+              buzzedTeamId: null,
+              buzzedPlayerName: null,
+              buzzedAt: null,
+              answerTimeLimit: 10,
+              answerTimeRemaining: 10,
+              playerAnswer: null,
+              lockedTeams: [],
+              firstAttemptTeamId: null,
+              hasReboundedToFirst: false
+            };
+            persistAndBroadcast(state);
+          });
+        });
+
+        document.getElementById('btn-return-setup').addEventListener('click', () => {
+          state.status = 'setup';
+          persistAndBroadcast(state);
+        });
+
+        document.getElementById('btn-reset-board').addEventListener('click', () => {
+          if (confirm('¿Deseas reiniciar todas las casillas y puntuaciones del tablero?')) {
+            const resetCats = state.categories.map(c => ({
+              ...c,
+              clues: c.clues.map(cl => ({ ...cl, isAnswered: false }))
+            }));
+            const resetTeams = state.teams.map(t => ({ ...t, score: 0 }));
+            state.categories = resetCats;
+            state.teams = resetTeams;
+            state.activeClue = null;
+            persistAndBroadcast(state);
+          }
+        });
+
+        document.getElementById('btn-global-logout-game').addEventListener('click', () => {
+          if (confirm('¿Confirmas el cierre de sesión global? La pantalla se bloqueará y se desconectará a los teléfonos.')) {
+            executeGlobalLogout();
+          }
+        });
+
+        if (state.activeClue) {
+          attachClueModalEvents();
+        }
+      }
+
+      // --- MODAL DE PISTA ACTIVA (REGLA DE 10 SEGUNDOS Y REBOTES) ---
+      function renderClueModalHTML() {
+        const clue = state.activeClue;
+        const b = state.buzzerState;
+        const buzzedTeam = state.teams.find(t => t.id === b.buzzedTeamId);
+
+        return `
+          <div class="fixed inset-0 z-40 flex items-center justify-center p-3 sm:p-6 bg-black/90 backdrop-blur-md animate-in fade-in duration-150">
+            <div class="w-full max-w-4xl bg-[#000222] border-4 border-[#D4AF37] rounded-3xl p-5 sm:p-8 shadow-[0_0_60px_rgba(212,175,55,0.4)] flex flex-col justify-between min-h-[460px] max-h-[92vh] overflow-y-auto">
+              <!-- Encabezado Modal -->
+              <div class="flex items-center justify-between border-b-2 border-blue-900/60 pb-3">
+                <span class="font-cinzel text-sm sm:text-base font-black text-[#FFCC00] uppercase tracking-wider">
+                  ${clue.categoryTitle || 'Pista'} • $${clue.value}
+                </span>
+                <button
+                  id="btn-close-modal-x"
+                  class="w-8 h-8 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 font-black text-sm flex items-center justify-center cursor-pointer"
+                >✕</button>
+              </div>
+
+              <!-- Texto de la Pregunta -->
+              <div class="my-6 sm:my-8 text-center px-4">
+                <h2 class="text-xl sm:text-3xl md:text-4xl font-black text-white font-cinzel tracking-wide leading-relaxed drop-shadow-md">
+                  "${clue.question}"
+                </h2>
+
+                ${clue.state === 'revealed' ? `
+                  <div class="mt-6 p-4 rounded-2xl bg-emerald-950/80 border-2 border-emerald-400 text-center animate-in zoom-in-95">
+                    <span class="text-xs font-black uppercase tracking-wider text-emerald-300 block mb-1">
+                      Respuesta Correcta
+                    </span>
+                    <span class="text-xl sm:text-2xl font-black text-white font-cinzel">
+                      ${clue.answer}
+                    </span>
+                  </div>
+                ` : ''}
+              </div>
+
+              <!-- Estados y Controles de Pulsadores y Temporizador 10s -->
+              <div class="space-y-4">
+                ${clue.state === 'reading' ? `
+                  <div class="text-center">
+                    <button
+                      id="btn-open-buzzers"
+                      class="py-4 px-8 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white font-black text-sm sm:text-base uppercase tracking-widest shadow-[0_0_30px_rgba(16,185,129,0.5)] border-2 border-white cursor-pointer active:scale-98 transition-all"
+                    >
+                      Habilitar Pulsadores para los Equipos
+                    </button>
+                    <p class="text-xs text-blue-300 mt-2">
+                      Los participantes podrán pulsar desde sus teléfonos móviles.
+                    </p>
+                  </div>
+                ` : ''}
+
+                ${clue.state === 'buzzing_open' ? `
+                  <div class="p-4 rounded-2xl bg-[#060CE9]/40 border-2 border-[#FFCC00] text-center animate-pulse-fast">
+                    <span class="text-sm sm:text-base font-black text-[#FFCC00] uppercase tracking-widest block">
+                      ¡PULSADORES ACTIVOS! ESPERANDO EQUIPO...
+                    </span>
+                    <div class="text-xs text-blue-200 mt-1">
+                      ${b.lockedTeams && b.lockedTeams.length > 0
+                        ? `Equipos bloqueados temporalmente por fallo: <strong class="text-rose-400">${b.lockedTeams.map(id => state.teams.find(t=>t.id===id)?.name).join(', ')}</strong>`
+                        : 'Todos los equipos habilitados para pulsar.'}
+                    </div>
+                  </div>
+                ` : ''}
+
+                ${clue.state === 'buzzed' && buzzedTeam ? `
+                  <div
+                    class="p-4 sm:p-5 rounded-2xl border-4 text-center space-y-3 shadow-xl"
+                    style="background-color: ${buzzedTeam.color}22; border-color: ${buzzedTeam.color};"
+                  >
+                    <div class="flex items-center justify-between">
+                      <span class="text-xs font-black uppercase tracking-wider text-white">
+                        Turno Otorgado:
+                      </span>
+                      <span
+                        class="px-3 py-1 rounded-xl text-xs sm:text-sm font-black text-white uppercase tracking-wider"
+                        style="background-color: ${buzzedTeam.color};"
+                      >
+                        ${buzzedTeam.name}
+                      </span>
+                    </div>
+
+                    <div class="text-lg sm:text-xl font-black text-white">
+                      Participante: <strong class="text-[#FFCC00]">${b.buzzedPlayerName || 'Pulsador Móvil'}</strong>
+                    </div>
+
+                    <!-- Cuenta Regresiva de 10 Segundos -->
+                    ${b.playerAnswer ? `
+                      <div class="p-2.5 rounded-xl bg-emerald-500/20 border border-emerald-400 text-emerald-300 text-xs font-bold">
+                        Respuesta enviada: <span class="text-white text-sm font-black">"${b.playerAnswer}"</span>
+                      </div>
+                    ` : `
+                      <div class="p-3 rounded-xl bg-amber-500/20 border-2 border-amber-400 text-center space-y-2">
+                        <div class="flex items-center justify-between text-xs font-black uppercase text-amber-300">
+                          <span>Tiempo límite para responder:</span>
+                          <span class="font-mono text-base font-black px-2.5 py-0.5 rounded bg-amber-500 text-black">
+                            ${b.answerTimeRemaining ?? 10}s
+                          </span>
+                        </div>
+                        <div class="w-full bg-amber-950 h-2.5 rounded-full overflow-hidden">
+                          <div
+                            class="h-full bg-amber-400 transition-all duration-1000 ease-linear rounded-full"
+                            style="width: ${((b.answerTimeRemaining ?? 10) / 10) * 100}%;"
+                          ></div>
+                        </div>
+                        <p class="text-[11px] text-amber-200">
+                          Si no responde en 10 segundos, el turno rebotará automáticamente al siguiente equipo.
+                        </p>
+                      </div>
+                    `}
+
+                    <!-- Botones de Calificación del Anfitrión -->
+                    <div class="grid grid-cols-2 gap-3 pt-2">
+                      <button
+                        id="btn-judge-correct"
+                        class="py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs sm:text-sm uppercase tracking-wider shadow border border-emerald-300 cursor-pointer"
+                      >
+                        Respuesta Correcta (+${clue.value})
+                      </button>
+                      <button
+                        id="btn-judge-wrong"
+                        class="py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-black text-xs sm:text-sm uppercase tracking-wider shadow border border-rose-300 cursor-pointer"
+                      >
+                        Incorrecto / Rebote (-${clue.value})
+                      </button>
+                    </div>
+                  </div>
+                ` : ''}
+
+                ${clue.state === 'revealed' ? `
+                  <button
+                    id="btn-modal-finish"
+                    class="w-full py-3.5 rounded-xl bg-[#FFCC00] hover:bg-yellow-300 text-[#000533] font-black text-sm uppercase tracking-widest shadow cursor-pointer"
+                  >
+                    Cerrar Pista y Regresar al Tablero
+                  </button>
+                ` : ''}
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      function attachClueModalEvents() {
+        const btnOpenBuzz = document.getElementById('btn-open-buzzers');
+        if (btnOpenBuzz) {
+          btnOpenBuzz.addEventListener('click', () => {
+            sound.playSelect();
+            state.activeClue.state = 'buzzing_open';
+            state.buzzerState.isOpen = true;
+            state.buzzerState.buzzedTeamId = null;
+            state.buzzerState.answerTimeRemaining = 10;
+            persistAndBroadcast(state);
+          });
+        }
+
+        const btnJudgeCorrect = document.getElementById('btn-judge-correct');
+        if (btnJudgeCorrect) {
+          btnJudgeCorrect.addEventListener('click', () => {
+            handleTeamCorrectAnswer();
+          });
+        }
+
+        const btnJudgeWrong = document.getElementById('btn-judge-wrong');
+        if (btnJudgeWrong) {
+          btnJudgeWrong.addEventListener('click', () => {
+            handleTeamFailedAnswer(state.buzzerState.buzzedTeamId, false);
+          });
+        }
+
+        const btnFinish = document.getElementById('btn-modal-finish');
+        const btnCloseX = document.getElementById('btn-close-modal-x');
+        const closeModal = () => {
+          const clue = state.activeClue;
+          const nextCats = state.categories.map(cat => ({
+            ...cat,
+            clues: cat.clues.map(c => c.id === clue.id ? { ...c, isAnswered: true } : c)
+          }));
+          state.categories = nextCats;
+          state.activeClue = null;
+          state.buzzerState = {
+            isOpen: false,
+            buzzedTeamId: null,
+            buzzedPlayerName: null,
+            buzzedAt: null,
+            answerTimeLimit: 10,
+            answerTimeRemaining: 10,
+            playerAnswer: null,
+            lockedTeams: [],
+            firstAttemptTeamId: null
+          };
+          persistAndBroadcast(state);
+        };
+
+        if (btnFinish) btnFinish.addEventListener('click', closeModal);
+        if (btnCloseX) btnCloseX.addEventListener('click', closeModal);
+      }
+
+      // --- PANTALLA 4: VISTA MÓVIL DEL JUGADOR (PULSADOR) ---
+      function renderPlayerView(container) {
+        const teamCount = state.teamCount || state.teams.length;
+        const availableTeams = state.teams.slice(0, teamCount);
+        let myTeamId = assignedTeamId || localStorage.getItem('jeopardy_player_team') || availableTeams[0]?.id;
+        let myName = localStorage.getItem('jeopardy_player_name') || '';
+
+        // Si aún no ha ingresado nombre
+        if (!myName) {
+          container.innerHTML = `
+            <div class="min-h-screen bg-gradient-to-b from-[#000533] via-[#020B4A] to-[#00021A] p-4 flex items-center justify-center">
+              <div class="w-full max-w-sm bg-[#000842] border-4 border-[#FFCC00] rounded-3xl p-6 text-center space-y-5 shadow-2xl animate-in zoom-in-95">
+                <div class="w-16 h-16 mx-auto rounded-2xl bg-[#060CE9] border-2 border-[#FFCC00] flex items-center justify-center font-cinzel text-3xl font-black text-[#FFCC00]">
+                  J!
+                </div>
+                <div>
+                  <h2 class="text-xl font-black text-white uppercase font-cinzel">
+                    Pulsador de Concurso
+                  </h2>
+                  <p class="text-xs text-blue-200 mt-1">
+                    Selecciona tu equipo e introduce tu nombre para unirte al juego en vivo.
+                  </p>
+                </div>
+
+                <form id="player-join-form" class="space-y-4 text-left">
+                  <div>
+                    <label class="block text-[11px] font-black uppercase tracking-wider text-blue-200 mb-1">
+                      Tu Equipo
+                    </label>
+                    <select
+                      id="player-team-select"
+                      class="w-full py-3 px-3 rounded-xl bg-[#000324] border-2 border-blue-500 text-white font-bold text-sm outline-none focus:border-[#FFCC00]"
+                    >
+                      ${availableTeams.map(t => `
+                        <option value="${t.id}" ${t.id === myTeamId ? 'selected' : ''}>
+                          ${t.name}
+                        </option>
+                      `).join('')}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label class="block text-[11px] font-black uppercase tracking-wider text-blue-200 mb-1">
+                      Nombre del Participante
+                    </label>
+                    <input
+                      id="player-name-input"
+                      type="text"
+                      placeholder="Ej. Sofía, Alejandro..."
+                      required
+                      class="w-full py-3 px-3 rounded-xl bg-[#000324] border-2 border-blue-500 text-white font-bold text-sm outline-none focus:border-[#FFCC00]"
+                    />
+                  </div>
+
+                  <button
+                    type="submit"
+                    class="w-full py-3.5 rounded-xl bg-[#FFCC00] hover:bg-yellow-300 text-[#000533] font-black text-sm uppercase tracking-widest shadow-lg cursor-pointer"
+                  >
+                    Entrar al Concurso
+                  </button>
+                </form>
+
+                <div class="pt-2">
+                  <a href="?" class="text-xs text-blue-300 hover:text-white underline">
+                    Volver al Modo Anfitrión
+                  </a>
+                </div>
+              </div>
+            </div>
+          `;
+
+          document.getElementById('player-join-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            sound.init();
+            const chosenName = document.getElementById('player-name-input').value.trim();
+            const chosenTeam = document.getElementById('player-team-select').value;
+            if (!chosenName) return;
+
+            localStorage.setItem('jeopardy_player_name', chosenName);
+            localStorage.setItem('jeopardy_player_team', chosenTeam);
+
+            // Registrar miembro en el equipo
+            const updatedTeams = state.teams.map(t => {
+              if (t.id === chosenTeam) {
+                const existing = t.members.find(m => m.name === chosenName);
+                if (!existing) {
+                  return { ...t, members: [...t.members, { id: 'm-' + Date.now(), name: chosenName }] };
+                }
+              }
+              return t;
+            });
+            state.teams = updatedTeams;
+            persistAndBroadcast(state);
+            render();
+          });
+          return;
+        }
+
+        // Ya está unido: mostrar pulsador
+        const myTeam = state.teams.find(t => t.id === myTeamId) || state.teams[0];
+        const b = state.buzzerState;
+        const isBuzzerOpen = b.isOpen;
+        const isMyTeamBuzzed = b.buzzedTeamId === myTeam.id;
+        const isLocked = (b.lockedTeams || []).includes(myTeam.id);
+
+        container.innerHTML = `
+          <div class="min-h-screen bg-[#000533] flex flex-col justify-between p-4 max-w-md mx-auto">
+            <!-- Barra Superior del Participante -->
+            <div class="flex items-center justify-between bg-[#000842] border-2 border-blue-800 rounded-2xl p-3 shadow-md">
+              <div class="flex items-center gap-2.5">
+                <span class="w-4 h-4 rounded-full" style="background-color: ${myTeam.color};"></span>
+                <div>
+                  <span class="text-xs font-black text-white block uppercase tracking-wider">${myTeam.name}</span>
+                  <span class="text-[11px] text-blue-300 font-bold">${myName}</span>
+                </div>
+              </div>
+              <button
+                id="btn-player-change-team"
+                class="text-[11px] text-blue-300 hover:text-white underline font-bold"
+              >
+                Cambiar
+              </button>
+            </div>
+
+            <!-- Zona Central: Pulsador o Formulario de Respuesta en 10s -->
+            <div class="my-auto py-6 text-center">
+              ${isMyTeamBuzzed ? `
+                <div class="bg-white border-4 border-[#FFCC00] rounded-3xl p-5 shadow-[0_0_40px_rgba(255,204,0,0.6)] space-y-3 text-blue-950 animate-in zoom-in-95">
+                  <span class="text-2xl font-black uppercase font-cinzel block text-amber-600">
+                    ¡TIENES EL TURNO!
+                  </span>
+
+                  ${b.playerAnswer ? `
+                    <div class="p-3 rounded-xl bg-emerald-100 border border-emerald-400 text-emerald-800 text-xs font-bold">
+                      ✓ Respuesta transmitida al anfitrión: <strong class="text-sm">"${b.playerAnswer}"</strong>
+                    </div>
+                  ` : `
+                    <div class="p-2.5 rounded-xl bg-amber-50 border-2 border-amber-300">
+                      <div class="flex items-center justify-between text-xs font-black text-amber-900 mb-1">
+                        <span>Tiempo para escribir:</span>
+                        <span class="font-mono text-sm font-black px-2 py-0.5 rounded bg-amber-500 text-white">
+                          ${b.answerTimeRemaining ?? 10}s
+                        </span>
+                      </div>
+                      <div class="w-full bg-amber-200 h-2 rounded-full overflow-hidden">
+                        <div
+                          class="h-full bg-amber-600 transition-all duration-1000 ease-linear rounded-full"
+                          style="width: ${((b.answerTimeRemaining ?? 10) / 10) * 100}%;"
+                        ></div>
+                      </div>
+                    </div>
+
+                    <form id="player-answer-form" class="space-y-3">
+                      <input
+                        id="player-answer-input"
+                        type="text"
+                        placeholder="Escribe tu respuesta aquí..."
+                        required
+                        autofocus
+                        class="w-full py-3 px-3 rounded-xl border-2 border-blue-950 font-bold text-sm text-blue-950 outline-none focus:border-amber-500"
+                      />
+                      <button
+                        type="submit"
+                        class="w-full py-3 rounded-xl bg-[#FFCC00] hover:bg-yellow-300 text-[#000533] font-black text-xs uppercase tracking-wider shadow cursor-pointer"
+                      >
+                        Enviar Respuesta (10s)
+                      </button>
+                    </form>
+                  `}
+                </div>
+              ` : `
+                <div>
+                  <button
+                    id="btn-player-buzz"
+                    ${!isBuzzerOpen || isLocked ? 'disabled' : ''}
+                    class="w-60 h-60 mx-auto rounded-full border-8 font-cinzel font-black text-3xl uppercase tracking-widest shadow-2xl transition-all flex flex-col items-center justify-center cursor-pointer select-none active:scale-95 ${
+                      isLocked
+                        ? 'bg-slate-800 border-slate-600 text-slate-500 cursor-not-allowed'
+                        : isBuzzerOpen
+                        ? 'bg-rose-600 hover:bg-rose-500 border-yellow-400 text-white shadow-[0_0_60px_rgba(225,29,72,0.8)] animate-pulse'
+                        : 'bg-blue-950 border-blue-800 text-blue-400/50 cursor-not-allowed'
+                    }"
+                  >
+                    <span>${isLocked ? 'BLOQUEADO' : isBuzzerOpen ? '¡PULSAR!' : 'EN ESPERA'}</span>
+                    <span class="text-[11px] font-sans font-bold tracking-normal opacity-80 mt-1">
+                      ${isLocked ? 'Turno rebotado a otro equipo' : isBuzzerOpen ? '¡Toca rápido!' : 'Pista en lectura'}
+                    </span>
+                  </button>
+                </div>
+              `}
+            </div>
+
+            <div class="text-center">
+              <a href="?" class="text-xs text-blue-400 hover:text-white underline">
+                Volver a Modo Anfitrión
+              </a>
+            </div>
+          </div>
+        `;
+
+        document.getElementById('btn-player-change-team')?.addEventListener('click', () => {
+          localStorage.removeItem('jeopardy_player_name');
+          render();
+        });
+
+        const btnBuzz = document.getElementById('btn-player-buzz');
+        if (btnBuzz && isBuzzerOpen && !isLocked) {
+          btnBuzz.addEventListener('click', () => {
+            sound.playBuzz();
+            state.buzzerState = {
+              ...state.buzzerState,
+              isOpen: false,
+              buzzedTeamId: myTeam.id,
+              buzzedPlayerName: myName,
+              buzzedAt: Date.now(),
+              answerTimeLimit: 10,
+              answerTimeRemaining: 10,
+              playerAnswer: null
+            };
+            if (state.activeClue) {
+              state.activeClue.state = 'buzzed';
+            }
+            persistAndBroadcast(state);
+          });
+        }
+
+        const answerForm = document.getElementById('player-answer-form');
+        if (answerForm) {
+          answerForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const input = document.getElementById('player-answer-input');
+            if (!input || !input.value.trim()) return;
+            sound.playSelect();
+            state.buzzerState.playerAnswer = input.value.trim();
+            persistAndBroadcast(state);
+          });
+        }
+      }
+
+      function renderPlayerLoggedOutNotice() {
+        const app = document.getElementById('app');
+        if (!app) return;
+        app.innerHTML = `
+          <div class="min-h-screen bg-gradient-to-b from-[#000533] via-[#020B4A] to-[#00021A] p-4 flex items-center justify-center">
+            <div class="w-full max-w-sm bg-[#000842] border-4 border-rose-500 rounded-3xl p-6 text-center space-y-4 shadow-2xl animate-in zoom-in-95">
+              <div class="w-16 h-16 mx-auto rounded-2xl bg-rose-500/20 border-2 border-rose-500 flex items-center justify-center text-rose-400 text-3xl font-black">
+                !
+              </div>
+              <h2 class="text-xl font-black text-white uppercase font-cinzel">
+                Sesión Finalizada
+              </h2>
+              <p class="text-xs sm:text-sm text-blue-200 leading-relaxed">
+                El anfitrión del concurso ha cerrado la sesión global. Esta pantalla ha sido desconectada.
+              </p>
+              <div class="pt-2">
+                <a
+                  href="?"
+                  class="block w-full py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs uppercase"
+                >
+                  Volver a la Portada
+                </a>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      // Iniciar renderizado al cargar la página
+      render();
+    })();
+  </script>
+</body>
+</html>
