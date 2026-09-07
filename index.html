@@ -6,6 +6,34 @@
   <title>Jeopardy Live Show - Sincronización en Tiempo Real</title>
   <meta name="description" content="Juego interactivo de Jeopardy en tiempo real con pulsadores móviles por QR, sincronización instantánea y gestión de hasta 5 equipos." />
 
+  <!-- Manejo global de errores para GitHub Pages: Captura excepciones y previene pantalla blanca -->
+  <script>
+    window.addEventListener('error', function(e) {
+      console.error('Global Error caught:', e);
+      var appEl = document.getElementById('app');
+      var existingErr = document.getElementById('global-error-screen');
+      if (!existingErr && (!appEl || !appEl.children.length || appEl.innerHTML.trim() === '')) {
+        var errBox = document.createElement('div');
+        errBox.id = 'global-error-screen';
+        errBox.style.cssText = 'position:fixed;inset:0;background:#000533;color:#ff6b6b;padding:24px;font-family:system-ui,sans-serif;z-index:99999;overflow:auto;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;';
+        errBox.innerHTML = '<div style="max-width:580px;background:#000842;border:2px solid #f59e0b;padding:24px;border-radius:20px;color:#fff;box-shadow:0 0 40px rgba(245,158,11,0.2);">' +
+          '<div style="width:48px;height:48px;margin:0 auto 12px;background:rgba(245,158,11,0.15);border:2px solid #f59e0b;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:24px;">⚠️</div>' +
+          '<h2 style="color:#FFCC00;font-size:20px;font-weight:900;margin-bottom:8px;text-transform:uppercase;">Diagnóstico de Ejecución</h2>' +
+          '<p style="color:#94a3b8;font-size:13px;margin-bottom:14px;line-height:1.5;">Se detectó una interrupción durante la inicialización en este navegador:</p>' +
+          '<pre style="background:#00021a;padding:12px;border-radius:10px;border:1px solid #1e293b;color:#fca5a5;font-size:12px;text-align:left;overflow-x:auto;white-space:pre-wrap;font-family:monospace;">' + (e.message || e.error || 'Error no especificado') + (e.filename ? '\nEn: ' + e.filename + ':' + e.lineno : '') + '</pre>' +
+          '<div style="margin-top:16px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">' +
+            '<button onclick="localStorage.clear();sessionStorage.clear();location.reload();" style="padding:10px 18px;background:#FFCC00;color:#000533;border:none;border-radius:10px;font-weight:900;font-size:12px;text-transform:uppercase;cursor:pointer;">Limpiar Memoria y Reiniciar</button>' +
+            '<button onclick="location.reload();" style="padding:10px 18px;background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:10px;font-weight:bold;font-size:12px;text-transform:uppercase;cursor:pointer;">Reintentar</button>' +
+          '</div>' +
+        '</div>';
+        document.body.appendChild(errBox);
+      }
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+      console.warn('Unhandled Promise Rejection:', e.reason);
+    });
+  </script>
+
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
@@ -39,6 +67,10 @@
   <!-- PeerJS CDN: Permite sincronización P2P WebRTC directa entre teléfono móvil y anfitrión sin servidor -->
   <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 
+  <!-- Firebase App & Realtime Database CDN (Compat v10) para comunicación real en la nube entre celulares y presentador -->
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
+
   <style>
     * { box-sizing: border-box; }
     body {
@@ -46,6 +78,14 @@
       user-select: none;
       -webkit-tap-highlight-color: transparent;
       overflow-x: hidden;
+    }
+    /* Permitir selección y edición fluida en campos de texto en dispositivos móviles */
+    input, textarea, select {
+      user-select: auto !important;
+      -webkit-user-select: auto !important;
+    }
+    input[type="text"], input[type="password"], input[type="number"], select {
+      font-size: 16px; /* Evita que Safari en iOS haga zoom forzado o desenfoque al abrir el teclado */
     }
     .font-cinzel { font-family: 'Cinzel', serif; }
     .font-bebas { font-family: 'Bebas Neue', cursive; }
@@ -78,18 +118,20 @@
     (function() {
       // --- CONSTANTES Y CONFIGURACIÓN BASE ---
       const AUTH_KEY = 'jeopardy_auth_status';
-      const STORAGE_KEY = 'jeopardy_game_store';
+      const STORAGE_KEY = 'jeopardy_state'; // Clave unificada solicitada para GitHub Pages y almacenamiento local
+      const LEGACY_STORAGE_KEY = 'jeopardy_game_store';
       const SYNC_EVENT_KEY = 'jeopardy_sync_action_event';
+      const SYNC_TRIGGER_KEY = 'jeopardy_sync_trigger';
       const BROADCAST_CHANNEL_NAME = 'jeopardy_global_sync_channel';
       const PASSWORD_HASH = 'Altair16'; // Clave obligatoria de anfitrión
 
       // Colores temáticos oficiales para hasta 5 equipos
       const DEFAULT_TEAMS_TEMPLATE = [
-        { id: 'team-1', name: 'Equipo Azul', color: '#2563EB', textColor: '#FFFFFF', score: 0, members: [] },
-        { id: 'team-2', name: 'Equipo Rojo', color: '#DC2626', textColor: '#FFFFFF', score: 0, members: [] },
-        { id: 'team-3', name: 'Equipo Verde', color: '#16A34A', textColor: '#FFFFFF', score: 0, members: [] },
-        { id: 'team-4', name: 'Equipo Dorado', color: '#CA8A04', textColor: '#FFFFFF', score: 0, members: [] },
-        { id: 'team-5', name: 'Equipo Morado', color: '#9333EA', textColor: '#FFFFFF', score: 0, members: [] }
+        { id: 'team-1', name: 'Equipo Azul', colorKey: 'azul', color: '#2563EB', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'team-2', name: 'Equipo Rojo', colorKey: 'rojo', color: '#DC2626', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'team-3', name: 'Equipo Verde', colorKey: 'verde', color: '#16A34A', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'team-4', name: 'Equipo Dorado', colorKey: 'dorado', color: '#CA8A04', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'team-5', name: 'Equipo Morado', colorKey: 'morado', color: '#9333EA', textColor: '#FFFFFF', score: 0, members: [] }
       ];
 
       const DEFAULT_CATEGORIES = [
@@ -291,7 +333,7 @@
 
       function loadState() {
         try {
-          const raw = localStorage.getItem(STORAGE_KEY);
+          const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
           if (raw) {
             const parsed = JSON.parse(raw);
             if (!parsed.roomCode) parsed.roomCode = getOrCreateRoomCode();
@@ -309,80 +351,455 @@
       let assignedTeamId = urlParams.get('team') || null;
       let roomCodeParam = urlParams.get('room') || state.roomCode;
 
-      // --- ARQUITECTURA DE SINCRONIZACIÓN TRIPLE ---
-      // 1. BroadcastChannel (Para pestañas/ventanas del mismo navegador)
-      // 2. Storage Events + Timestamps (Para compatibilidad de almacenamiento local)
-      // 3. WebRTC P2P con PeerJS (Para conectar teléfonos móviles con el anfitrión sin backend)
+      // --- ARQUITECTURA DE SINCRONIZACIÓN EN TIEMPO REAL ---
+      // =========================================================================
+      // CONFIGURACIÓN DE FIREBASE REALTIME DATABASE (COMUNICACIÓN MÓVIL EN LA NUBE)
+      // =========================================================================
+      // Instrucciones para conectar tus credenciales de Firebase:
+      // 1. Ve a https://console.firebase.google.com/ y abre tu proyecto.
+      // 2. Ve a "Realtime Database" en el menú izquierdo -> "Crear base de datos".
+      // 3. En la pestaña "Reglas" (Rules), coloca para desarrollo o evento en vivo:
+      //    {
+      //      "rules": {
+      //        ".read": true,
+      //        ".write": true
+      //      }
+      //    }
+      // 4. Ve a Configuración del Proyecto (icono de engranaje) -> "Tus apps" -> </> Web.
+      // 5. Copia tus claves y pégalas en el siguiente objeto firebaseConfig:
+      // =========================================================================
+      const firebaseConfig = {
+        apiKey: "AIzaSy_REEMPLAZA_CON_TU_API_KEY_AQUI",
+        authDomain: "tu-proyecto-jeopardy.firebaseapp.com",
+        databaseURL: "https://tu-proyecto-jeopardy-default-rtdb.firebaseio.com",
+        projectId: "tu-proyecto-jeopardy",
+        storageBucket: "tu-proyecto-jeopardy.appspot.com",
+        messagingSenderId: "123456789012",
+        appId: "1:123456789012:web:abcdef1234567890"
+      };
+
+      let fbApp = null;
+      let fbDb = null;
+      let isFirebaseReady = false;
+
+      function getTeamColorKey(team) {
+        if (!team) return 'azul';
+        if (team.colorKey) return team.colorKey;
+        const name = (team.name || '').toLowerCase();
+        if (name.includes('azul') || name.includes('blue')) return 'azul';
+        if (name.includes('rojo') || name.includes('red')) return 'rojo';
+        if (name.includes('verde') || name.includes('green')) return 'verde';
+        if (name.includes('dora') || name.includes('amar') || name.includes('gold') || name.includes('yellow')) return 'dorado';
+        if (name.includes('mora') || name.includes('purp')) return 'morado';
+        return team.id || 'azul';
+      }
+
+      function getFirebaseSessionId() {
+        const rawCode = state.roomCode || roomCodeParam || 'JEP1000';
+        return String(rawCode).replace(/[.#$\[\]]/g, '_');
+      }
+
+      function initFirebaseRealtimeDB() {
+        if (typeof firebase === 'undefined') return;
+        try {
+          const isConfigured = firebaseConfig.apiKey &&
+            !firebaseConfig.apiKey.includes('REEMPLAZA') &&
+            firebaseConfig.databaseURL &&
+            !firebaseConfig.databaseURL.includes('tu-proyecto');
+
+          if (isConfigured) {
+            if (!firebase.apps.length) {
+              fbApp = firebase.initializeApp(firebaseConfig);
+            } else {
+              fbApp = firebase.app();
+            }
+            fbDb = firebase.database();
+            isFirebaseReady = true;
+            console.log('🔥 [Firebase Realtime Database] Conexión establecida con la nube.');
+            setupFirebaseSessionListeners();
+          } else {
+            console.info('ℹ️ [Firebase] Esperando credenciales en firebaseConfig. La aplicación está operando en alta disponibilidad mediante WebSocket + REST + PeerJS + BroadcastChannel.');
+          }
+        } catch (err) {
+          console.warn('⚠️ [Firebase] Error inicializando Realtime Database:', err.message);
+        }
+      }
+
+      function setupFirebaseSessionListeners() {
+        if (!fbDb) return;
+        const sessionId = getFirebaseSessionId();
+
+        // 1. Escuchar la ruta /sessions/{sessionId}/teams para reflejar participantes en tiempo real
+        const teamsRef = fbDb.ref(`sessions/${sessionId}/teams`);
+        teamsRef.on('value', (snapshot) => {
+          const teamsVal = snapshot.val();
+          if (!teamsVal) return;
+
+          let hasChanges = false;
+          Object.keys(teamsVal).forEach(teamColorKey => {
+            const teamNode = teamsVal[teamColorKey];
+            const playersNode = teamNode?.players || {};
+            const membersList = Object.keys(playersNode).map(k => {
+              const p = playersNode[k];
+              return {
+                id: p.id || k,
+                name: p.name || 'Participante',
+                joinedAt: p.joinedAt || Date.now()
+              };
+            });
+
+            const matched = state.teams.find(t =>
+              getTeamColorKey(t).toLowerCase() === teamColorKey.toLowerCase() ||
+              t.id.toLowerCase() === teamColorKey.toLowerCase() ||
+              t.name.toLowerCase().includes(teamColorKey.toLowerCase())
+            );
+
+            if (matched) {
+              matched.members = membersList;
+              hasChanges = true;
+            }
+          });
+
+          if (hasChanges) {
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+              localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
+            } catch (e) {}
+            updateLiveParticipantsDOM();
+          }
+        });
+
+        // 2. Escuchar el estado de la sesión /sessions/{sessionId}/status
+        const statusRef = fbDb.ref(`sessions/${sessionId}/status`);
+        statusRef.on('value', (snapshot) => {
+          const sVal = snapshot.val();
+          if (sVal === 'closed' && currentRole === 'player') {
+            localStorage.removeItem('jeopardy_player_name');
+            localStorage.removeItem('jeopardy_player_team');
+            localStorage.removeItem('jeopardy_player_id');
+            localStorage.removeItem('jeopardy_player_registered');
+            renderPlayerSessionClosedScreen();
+          }
+        });
+
+        // 3. Escuchar reseteos del tablero /sessions/{sessionId}/board
+        const boardRef = fbDb.ref(`sessions/${sessionId}/board`);
+        boardRef.on('value', (snapshot) => {
+          const bVal = snapshot.val();
+          if (bVal && bVal.resetTimestamp) {
+            state.categories.forEach(cat => {
+              cat.clues.forEach(cl => {
+                cl.isAnswered = false;
+                cl.answeredByTeamId = null;
+              });
+            });
+            state.teams.forEach(t => { t.score = 0; });
+            state.activeClue = null;
+            state.buzzerState = {
+              isOpen: false,
+              buzzedTeamId: null,
+              buzzedPlayerName: null,
+              buzzedAt: null,
+              answerTimeLimit: 10,
+              answerTimeRemaining: 10,
+              playerAnswer: null,
+              lockedTeams: [],
+              firstAttemptTeamId: null,
+              hasReboundedToFirst: false,
+              attemptedMembers: []
+            };
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+              localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
+            } catch (e) {}
+            if (currentRole === 'host' && state.status === 'playing') {
+              render();
+            }
+          }
+        });
+      }
+
+      // 1. WebSocket centralizado al servidor (/ws) con reconexión automática (solo en entornos con backend activo)
+      // 2. Respaldo HTTP REST en tiempo real (/api/sync/action y /api/sync/state)
+      // 3. BroadcastChannel (Para pestañas del mismo navegador)
+      // 4. Storage Events + Timestamps (Para compatibilidad de ventanas locales)
+      // 5. WebRTC P2P con PeerJS (Como vía suplementaria)
+      // 6. Firebase Realtime Database (Para sincronización global en GitHub Pages y producción)
+
+      const isStaticHost = window.location.hostname.includes('github.io') ||
+        window.location.hostname.includes('github.dev') ||
+        window.location.protocol === 'file:';
+
+      let ws = null;
+      let wsConnected = false;
+
+      function connectWebSocket() {
+        if (isStaticHost || !window.location.protocol.startsWith('http')) return;
+        try {
+          const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const wsUrl = `${proto}//${window.location.host}/ws`;
+          ws = new WebSocket(wsUrl);
+
+          ws.onopen = () => {
+            wsConnected = true;
+            updateNetworkIndicator(true);
+            try {
+              ws.send(JSON.stringify({ type: 'GET_STATE' }));
+            } catch (e) {}
+          };
+
+          ws.onmessage = (evt) => {
+            try {
+              const data = JSON.parse(evt.data);
+              if (data.type === 'STATE_UPDATE' && data.state) {
+                applyServerState(data.state);
+              } else if (data.type === 'PLAYER_JOINED') {
+                if (data.state) {
+                  applyServerState(data.state);
+                } else if (data.payload) {
+                  handleSyncAction('PLAYER_JOIN', data.payload);
+                }
+                sound.playJoin();
+                updateLiveParticipantsDOM();
+              } else if (data.type === 'BOARD_RESET' || data.action === 'RESET_BOARD') {
+                handleSyncAction('RESET_BOARD', {});
+              } else if (data.type === 'AUDIO_TRIGGER') {
+                if (data.sound === 'wrong') sound.playWrong();
+                else if (data.sound === 'timeup') sound.playTimeUp();
+                else if (data.sound === 'buzz') sound.playBuzz();
+                if (data.state) applyServerState(data.state);
+              } else if (data.type === 'GLOBAL_LOGOUT' || data.type === 'SESSION_TERMINATED' || data.action === 'GLOBAL_LOGOUT') {
+                handleSyncAction('GLOBAL_LOGOUT', {});
+              } else if (data.action) {
+                handleSyncAction(data.action, data.payload);
+              }
+            } catch (e) {
+              console.warn('Error leyendo mensaje WS:', e);
+            }
+          };
+
+          ws.onclose = () => {
+            wsConnected = false;
+            updateNetworkIndicator(false);
+            setTimeout(connectWebSocket, 1200);
+          };
+
+          ws.onerror = () => {
+            wsConnected = false;
+            updateNetworkIndicator(false);
+          };
+        } catch (err) {
+          console.warn('WebSocket init warning:', err);
+        }
+      }
+
+      function applyServerState(serverState) {
+        if (!serverState) return;
+
+        if (currentRole === 'player') {
+          // El móvil adopta el estado del servidor
+          const wasOpen = state.buzzerState?.isOpen;
+          state.buzzerState = serverState.buzzerState || state.buzzerState;
+          state.activeClue = serverState.activeClue || state.activeClue;
+          state.teams = serverState.teams || state.teams;
+          state.roomCode = serverState.roomCode || state.roomCode;
+          state.lastUpdated = serverState.lastUpdated || Date.now();
+          if (serverState.status) state.status = serverState.status;
+
+          try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          } catch (e) {}
+
+          // Vibración táctil si se acaban de abrir los pulsadores
+          if (!wasOpen && serverState.buzzerState?.isOpen && 'vibrate' in navigator) {
+            navigator.vibrate(200);
+          }
+          render();
+          return;
+        }
+
+        if (currentRole === 'host') {
+          const prevTotalMembers = (state.teams || []).reduce((acc, t) => acc + (t.members?.length || 0), 0);
+
+          // Sincronizar miembros registrados desde los teléfonos móviles
+          if (serverState.teams && Array.isArray(serverState.teams)) {
+            serverState.teams.forEach(st => {
+              const lt = state.teams.find(t => t.id === st.id || t.name.toLowerCase() === st.name.toLowerCase());
+              if (lt) {
+                lt.members = st.members || [];
+              }
+            });
+          }
+
+          const newTotalMembers = (state.teams || []).reduce((acc, t) => acc + (t.members?.length || 0), 0);
+          if (newTotalMembers > prevTotalMembers) {
+            sound.playJoin();
+          }
+
+          // Sincronizar eventos del pulsador móvil
+          if (serverState.buzzerState) {
+            const sb = serverState.buzzerState;
+            if (sb.buzzedTeamId && state.buzzerState.buzzedTeamId !== sb.buzzedTeamId) {
+              state.buzzerState = sb;
+              if (state.activeClue) state.activeClue.state = 'buzzed';
+              sound.playBuzz();
+            } else if (sb.playerAnswer && state.buzzerState.playerAnswer !== sb.playerAnswer) {
+              state.buzzerState.playerAnswer = sb.playerAnswer;
+            } else if (typeof sb.answerTimeRemaining === 'number' && state.buzzerState.buzzedTeamId) {
+              state.buzzerState.answerTimeRemaining = sb.answerTimeRemaining;
+            }
+          }
+
+          try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          } catch (e) {}
+
+          updateLiveParticipantsDOM();
+          if (state.status !== 'qrcodes' && state.status !== 'setup') {
+            render();
+          }
+        }
+      }
+
+      // Polling de seguridad de alta frecuencia (500ms) vía REST (solo en entornos con backend activo)
+      setInterval(() => {
+        if (isStaticHost || !window.location.protocol.startsWith('http')) return;
+        fetch('./api/sync/state')
+          .then(res => {
+            if (!res.ok) return null;
+            return res.json();
+          })
+          .then(data => {
+            if (data && data.state) {
+              if (currentRole === 'player') {
+                if (data.state.lastUpdated > (state.lastUpdated || 0) || data.state.buzzerState?.isOpen !== state.buzzerState?.isOpen) {
+                  applyServerState(data.state);
+                }
+              } else if (currentRole === 'host') {
+                // Verificar si hay nuevos participantes en algún equipo
+                let hasChanges = false;
+                if (data.state.teams) {
+                  data.state.teams.forEach(st => {
+                    const lt = state.teams.find(t => t.id === st.id || t.name.toLowerCase() === st.name.toLowerCase());
+                    if (lt && JSON.stringify(lt.members) !== JSON.stringify(st.members)) {
+                      lt.members = st.members || [];
+                      hasChanges = true;
+                    }
+                  });
+                }
+                // O si alguien pulsó
+                if (data.state.buzzerState?.buzzedTeamId && !state.buzzerState.buzzedTeamId) {
+                  applyServerState(data.state);
+                } else if (hasChanges) {
+                  render();
+                }
+              }
+            }
+          })
+          .catch(() => {});
+      }, 500);
+
       let bc = null;
       try {
         if ('BroadcastChannel' in window) {
           bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
           bc.onmessage = (evt) => {
-            if (evt.data) handleSyncAction(evt.data.action, evt.data.payload);
+            if (!evt.data) return;
+            // Si viene un snapshot completo del estado
+            if (evt.data.state) {
+              const prevMembersCount = (state.teams || []).reduce((acc, t) => acc + (t.members?.length || 0), 0);
+              const newMembersCount = (evt.data.state.teams || []).reduce((acc, t) => acc + (t.members?.length || 0), 0);
+              state = evt.data.state;
+              try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+              } catch (e) {}
+              if (newMembersCount > prevMembersCount) sound.playJoin();
+              render();
+              return;
+            }
+            if (evt.data.action) {
+              handleSyncAction(evt.data.action, evt.data.payload);
+            }
           };
         }
       } catch (e) {}
 
-      // Escucha de Storage Events de almacenamiento local
+      // Escucha inmediata de Storage Events de almacenamiento local entre ventanas/pestañas
       window.addEventListener('storage', (e) => {
+        if (e.key === STORAGE_KEY || e.key === LEGACY_STORAGE_KEY || e.key === SYNC_TRIGGER_KEY || e.key === SYNC_EVENT_KEY) {
+          try {
+            const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
+            if (raw) {
+              const freshState = JSON.parse(raw);
+              const prevMembersCount = (state.teams || []).reduce((acc, t) => acc + (t.members?.length || 0), 0);
+              const newMembersCount = (freshState.teams || []).reduce((acc, t) => acc + (t.members?.length || 0), 0);
+              state = freshState;
+              if (newMembersCount > prevMembersCount) {
+                sound.playJoin();
+              }
+              render();
+            }
+          } catch (err) {}
+        }
         if (e.key === SYNC_EVENT_KEY && e.newValue) {
           try {
             const data = JSON.parse(e.newValue);
-            handleSyncAction(data.action, data.payload);
-          } catch (err) {}
-        } else if (e.key === STORAGE_KEY && e.newValue) {
-          try {
-            const newState = JSON.parse(e.newValue);
-            if (newState.lastUpdated > state.lastUpdated) {
-              state = newState;
-              render();
+            if (data && data.action) {
+              handleSyncAction(data.action, data.payload);
             }
           } catch (err) {}
         }
       });
 
-      // Polling de seguridad de almacenamiento (500ms) para garantizar refresco
+      // Polling de ultra-baja latencia (300ms) en localStorage como garantía absoluta de sincronización
       setInterval(() => {
         try {
-          const raw = localStorage.getItem(STORAGE_KEY);
+          const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
           if (raw) {
             const s = JSON.parse(raw);
-            if (s.lastUpdated > state.lastUpdated) {
-              state = s;
+            const currentMembersSummary = (state.teams || []).map(t => `${t.id}:${(t.members||[]).map(m=>m.name).join(',')}`).join('|');
+            const newMembersSummary = (s.teams || []).map(t => `${t.id}:${(t.members||[]).map(m=>m.name).join(',')}`).join('|');
+            if (currentMembersSummary !== newMembersSummary || (s.buzzerState?.isOpen !== state.buzzerState?.isOpen && currentRole === 'player')) {
+              const prevTotal = (state.teams || []).reduce((acc, t) => acc + (t.members?.length || 0), 0);
+              const newTotal = (s.teams || []).reduce((acc, t) => acc + (t.members?.length || 0), 0);
+              state.teams = s.teams;
+              if (s.buzzerState) state.buzzerState = s.buzzerState;
+              if (s.activeClue) state.activeClue = s.activeClue;
+              state.lastUpdated = s.lastUpdated || Date.now();
+              if (newTotal > prevTotal && currentRole === 'host') sound.playJoin();
               render();
             }
           }
         } catch (e) {}
-      }, 500);
+      }, 300);
 
-      // --- CONEXIÓN P2P WEBRTC (PEERJS) ---
+      // --- CONEXIÓN P2P WEBRTC (PEERJS) COMO VÍA SECUNDARIA ---
       let hostPeer = null;
       let hostConnections = [];
       let playerPeer = null;
       let playerConnection = null;
 
       function initNetworkSync() {
+        initFirebaseRealtimeDB();
+        connectWebSocket();
+
         if (typeof Peer === 'undefined') return;
 
         if (currentRole === 'host') {
-          // El host registra una ID predecible basada en el roomCode
           const hostPeerId = `jeopardy-host-${state.roomCode}`;
           try {
             hostPeer = new Peer(hostPeerId, { debug: 0 });
             hostPeer.on('open', () => {
-              console.log('Host P2P iniciado:', hostPeerId);
               updateNetworkIndicator(true);
             });
             hostPeer.on('connection', (conn) => {
               hostConnections.push(conn);
-              // Enviar estado inicial al jugador recién conectado
               conn.on('open', () => {
                 conn.send({ action: 'STATE_SNAPSHOT', payload: state });
               });
               conn.on('data', (data) => {
                 if (data && data.action) {
                   handleSyncAction(data.action, data.payload);
-                  // Retransmitir a otros participantes
                   hostConnections.forEach(c => {
                     if (c !== conn && c.open) c.send(data);
                   });
@@ -392,22 +809,16 @@
                 hostConnections = hostConnections.filter(c => c !== conn);
               });
             });
-            hostPeer.on('error', (err) => {
-              // Si la ID ya estaba tomada, reintentar con sufijo
-              console.warn('Peer host info:', err.type);
-            });
           } catch (e) {
             console.warn(e);
           }
         } else if (currentRole === 'player') {
-          // El teléfono móvil se conecta al host usando el roomCode del QR
           const targetHostId = `jeopardy-host-${roomCodeParam}`;
           try {
             playerPeer = new Peer(null, { debug: 0 });
             playerPeer.on('open', () => {
               playerConnection = playerPeer.connect(targetHostId, { reliable: true });
               playerConnection.on('open', () => {
-                console.log('Jugador conectado al host P2P:', targetHostId);
                 updateNetworkIndicator(true);
               });
               playerConnection.on('data', (data) => {
@@ -416,7 +827,7 @@
                 }
               });
               playerConnection.on('close', () => {
-                updateNetworkIndicator(false);
+                if (!wsConnected) updateNetworkIndicator(false);
               });
             });
           } catch (e) {
@@ -428,14 +839,14 @@
       function updateNetworkIndicator(isConnected) {
         const dots = document.querySelectorAll('.sync-status-dot');
         dots.forEach(d => {
-          if (isConnected) {
+          if (isConnected || wsConnected) {
             d.classList.remove('bg-amber-400');
             d.classList.add('bg-emerald-400');
-            d.setAttribute('title', 'Sincronizado en tiempo real (P2P + Storage)');
+            d.setAttribute('title', 'Sincronizado en tiempo real (WebSocket + P2P)');
           } else {
             d.classList.remove('bg-emerald-400');
             d.classList.add('bg-amber-400');
-            d.setAttribute('title', 'Sincronizado vía LocalStorage');
+            d.setAttribute('title', 'Sincronizando...');
           }
         });
       }
@@ -445,17 +856,40 @@
         // 1. Ejecutar localmente
         handleSyncAction(action, payload);
 
-        // 2. Transmitir por BroadcastChannel
+        // 2. Transmitir por WebSocket en tiempo real
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: 'ACTION', action, payload }));
+          } catch (e) {}
+        }
+
+        // 3. Transmitir por REST HTTP redundante (solo en entornos con backend activo)
+        if (!isStaticHost && window.location.protocol.startsWith('http')) {
+          fetch('./api/sync/action', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action, payload })
+          }).then(r => {
+            if (!r.ok) return null;
+            return r.json();
+          }).then(res => {
+            if (res && res.state && currentRole === 'player') {
+              applyServerState(res.state);
+            }
+          }).catch(() => {});
+        }
+
+        // 4. Transmitir por BroadcastChannel
         try {
           if (bc) bc.postMessage({ action, payload, ts: Date.now() });
         } catch (e) {}
 
-        // 3. Transmitir por Storage Event (cambio forzado de valor)
+        // 5. Transmitir por Storage Event (cambio forzado de valor)
         try {
           localStorage.setItem(SYNC_EVENT_KEY, JSON.stringify({ action, payload, ts: Date.now() }));
         } catch (e) {}
 
-        // 4. Transmitir por WebRTC DataChannel
+        // 6. Transmitir por WebRTC DataChannel
         if (currentRole === 'host' && hostConnections.length > 0) {
           hostConnections.forEach(c => {
             if (c.open) c.send({ action, payload });
@@ -473,17 +907,33 @@
         } catch (e) {}
 
         if (broadcast) {
-          // 1. Transmitir por BroadcastChannel a otras pestañas
+          // 1. Transmitir por WebSocket
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.send(JSON.stringify({ type: 'STATE_SNAPSHOT', state: newState }));
+            } catch (e) {}
+          }
+
+          // 2. Transmitir por REST HTTP
+          if (window.location.protocol.startsWith('http')) {
+            fetch('/api/sync/action', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action: 'STATE_SNAPSHOT', payload: newState })
+            }).catch(() => {});
+          }
+
+          // 3. Transmitir por BroadcastChannel a otras pestañas
           try {
             if (bc) bc.postMessage({ action: 'STATE_SNAPSHOT', payload: state, ts: Date.now() });
           } catch (e) {}
 
-          // 2. Disparar Storage Event para sincronización inmediata entre ventanas
+          // 4. Disparar Storage Event para sincronización inmediata entre ventanas
           try {
             localStorage.setItem(SYNC_EVENT_KEY, JSON.stringify({ action: 'STATE_SNAPSHOT', payload: state, ts: Date.now() }));
           } catch (e) {}
 
-          // 3. Transmitir inmediatamente a los teléfonos móviles conectados por WebRTC
+          // 5. Transmitir inmediatamente a los teléfonos móviles conectados por WebRTC
           if (currentRole === 'host' && hostConnections.length > 0) {
             hostConnections.forEach(c => {
               if (c.open) c.send({ action: 'STATE_SNAPSHOT', payload: state });
@@ -496,28 +946,255 @@
         render();
       }
 
+      // Actualización reactiva y sin parpadeo del listado de participantes y contadores
+      function updateLiveParticipantsDOM() {
+        if (currentRole !== 'host') return;
+        const teamCount = state.teamCount || state.teams.length;
+        const activeTeams = state.teams.slice(0, teamCount);
+        const totalConnected = activeTeams.reduce((acc, t) => acc + (t.members?.length || 0), 0);
+
+        // 1. Vista de Códigos QR (renderQRCodesScreen)
+        activeTeams.forEach((team) => {
+          const countEl = document.getElementById(`qr-team-count-${team.id}`);
+          if (countEl) {
+            countEl.textContent = `${team.members.length} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} registrados`;
+          }
+          const badgeCountEl = document.getElementById(`qr-team-badge-count-${team.id}`);
+          if (badgeCountEl) {
+            badgeCountEl.textContent = String(team.members.length);
+          }
+          const membersBox = document.getElementById(`qr-team-members-${team.id}`);
+          if (membersBox) {
+            if (team.members.length === 0) {
+              membersBox.innerHTML = `
+                <span class="text-[11px] text-blue-400/60 italic py-1">
+                  Esperando participantes...
+                </span>
+              `;
+            } else {
+              membersBox.innerHTML = team.members.map(m => `
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-900/90 text-white border border-blue-500 shadow-sm animate-in zoom-in-95">
+                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                  <span class="truncate max-w-[80px]">${m.name}</span>
+                  <button
+                    type="button"
+                    data-team-id="${team.id}"
+                    data-member-id="${m.id}"
+                    class="btn-remove-member hover:text-rose-400 text-xs font-black ml-0.5 cursor-pointer"
+                    title="Remover participante"
+                  >×</button>
+                </span>
+              `).join('');
+
+              membersBox.querySelectorAll('.btn-remove-member').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                  e.stopPropagation();
+                  const tId = btn.getAttribute('data-team-id');
+                  const mId = btn.getAttribute('data-member-id');
+                  dispatchAction('PLAYER_REMOVE', { teamId: tId, memberId: mId });
+                });
+              });
+            }
+          }
+
+          // 2. Vista de Configuración Inicial (renderSetupScreen)
+          const setupCountEl = document.getElementById(`setup-team-count-${team.id}`);
+          if (setupCountEl) {
+            setupCountEl.textContent = `${team.members?.length || 0} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam}`;
+          }
+          const setupMembersBox = document.getElementById(`setup-team-members-${team.id}`);
+          if (setupMembersBox) {
+            if ((team.members || []).length === 0) {
+              setupMembersBox.innerHTML = `<span class="text-[10px] text-blue-400/60 italic py-1">Esperando...</span>`;
+            } else {
+              setupMembersBox.innerHTML = team.members.map(m => `
+                <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900 text-white border border-blue-500 shadow-sm">
+                  ${m.name}
+                </span>
+              `).join('');
+            }
+          }
+        });
+
+        // Contadores globales
+        const qrTotalEl = document.getElementById('qr-total-connected-count');
+        if (qrTotalEl) {
+          qrTotalEl.textContent = String(totalConnected);
+        }
+        const setupTotalEl = document.getElementById('setup-total-connected-count');
+        if (setupTotalEl) {
+          setupTotalEl.innerHTML = `
+            <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+            ${totalConnected} Conectados
+          `;
+        }
+      }
+
+      // Función de reseteo completo del tablero y marcadores
+      function executeResetBoard() {
+        sound.playSelect();
+        // 1. Restaurar marcadores a $0
+        state.teams = state.teams.map(t => ({
+          ...t,
+          score: 0
+        }));
+
+        // 2. Restaurar todas las tarjetas de preguntas con sus valores originales y no respondidas
+        state.categories = state.categories.map(c => ({
+          ...c,
+          clues: c.clues.map(cl => ({
+            ...cl,
+            isAnswered: false,
+            answeredByTeamId: null
+          }))
+        }));
+
+        // 3. Resetear buzzer/pulsador a desbloqueado y sin turnos pendientes
+        state.activeClue = null;
+        state.buzzerState = {
+          isOpen: false,
+          buzzedTeamId: null,
+          buzzedPlayerName: null,
+          buzzedAt: null,
+          answerTimeLimit: 10,
+          answerTimeRemaining: 10,
+          playerAnswer: null,
+          lockedTeams: [],
+          firstAttemptTeamId: null,
+          hasReboundedToFirst: false,
+          attemptedMembers: []
+        };
+
+        // 4. Persistir localmente
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
+        } catch (e) {}
+
+        // 5. Sincronizar en Firebase Realtime Database
+        if (fbDb) {
+          const sessionId = getFirebaseSessionId();
+          fbDb.ref(`sessions/${sessionId}/board`).set({
+            resetTimestamp: Date.now(),
+            scores: state.teams.reduce((acc, t) => { acc[t.id] = 0; return acc; }, {}),
+            answeredClues: {}
+          }).catch(err => console.warn('Firebase reset board error:', err));
+        }
+
+        // 6. Transmitir de inmediato al servidor y a todos los clientes
+        dispatchAction('RESET_BOARD', {});
+
+        // 7. Endpoint REST directo de respaldo
+        if (window.location.protocol.startsWith('http')) {
+          fetch('/api/game/reset', { method: 'POST' }).catch(() => {});
+        }
+
+        render();
+      }
+
       // Procesador centralizado de acciones sincronizadas
       function handleSyncAction(action, payload) {
         switch (action) {
           case 'PLAYER_JOIN': {
-            const { teamId, memberName, memberId } = payload;
-            const updatedTeams = state.teams.map(t => {
-              if (t.id === teamId) {
-                const existing = t.members.find(m => m.name.toLowerCase() === memberName.toLowerCase());
-                if (!existing) {
-                  // Verificar límite de miembros
-                  if (t.members.length < state.maxMembersPerTeam) {
-                    return {
-                      ...t,
-                      members: [...t.members, { id: memberId || 'm-' + Date.now(), name: memberName, joinedAt: Date.now() }]
-                    };
-                  }
-                }
+            const rawTeam = payload?.teamId;
+            const cleanName = String(payload?.playerName || payload?.memberName || '').trim();
+            const memberId = String(payload?.sessionId || payload?.memberId || ('m-' + Date.now())).trim();
+            if (!cleanName || !rawTeam) break;
+
+            // 1. Quitar al jugador de cualquier otro equipo para evitar duplicados
+            let updatedTeams = state.teams.map(t => ({
+              ...t,
+              members: (t.members || []).filter(m => m.name.toLowerCase() !== cleanName.toLowerCase() && m.id !== memberId)
+            }));
+
+            // 2. Buscar equipo por id o nombre
+            let targetTeam = updatedTeams.find(t => 
+              t.id === rawTeam || 
+              t.name.toLowerCase() === String(rawTeam).toLowerCase() ||
+              t.id.toLowerCase() === String(rawTeam).toLowerCase()
+            );
+            if (!targetTeam && updatedTeams.length > 0) targetTeam = updatedTeams[0];
+
+            if (targetTeam) {
+              const max = state.maxMembersPerTeam || 5;
+              if (max === 0 || targetTeam.members.length < max) {
+                targetTeam.members.push({
+                  id: memberId,
+                  name: cleanName,
+                  joinedAt: Date.now()
+                });
               }
-              return t;
-            });
+            }
+
+            state.teams = updatedTeams;
+            state.lastUpdated = Date.now();
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+              localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
+            } catch (e) {}
+
             sound.playJoin();
-            persistState({ ...state, teams: updatedTeams });
+            updateLiveParticipantsDOM();
+            if (state.status !== 'qrcodes' && state.status !== 'setup') {
+              render();
+            }
+            break;
+          }
+
+          case 'RESET_BOARD': {
+            state.categories = state.categories.map(c => ({
+              ...c,
+              clues: c.clues.map(cl => ({
+                ...cl,
+                isAnswered: false,
+                answeredByTeamId: null
+              }))
+            }));
+            state.teams = state.teams.map(t => ({
+              ...t,
+              score: 0
+            }));
+            state.activeClue = null;
+            state.buzzerState = {
+              isOpen: false,
+              buzzedTeamId: null,
+              buzzedPlayerName: null,
+              buzzedAt: null,
+              answerTimeLimit: 10,
+              answerTimeRemaining: 10,
+              playerAnswer: null,
+              lockedTeams: [],
+              firstAttemptTeamId: null,
+              hasReboundedToFirst: false,
+              attemptedMembers: []
+            };
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+              localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
+            } catch (e) {}
+            sound.playSelect();
+            render();
+            break;
+          }
+
+          case 'GLOBAL_LOGOUT': {
+            if (currentRole === 'player') {
+              localStorage.removeItem('jeopardy_player_name');
+              localStorage.removeItem('jeopardy_player_team');
+              localStorage.removeItem('jeopardy_player_id');
+              localStorage.removeItem('jeopardy_player_registered');
+              renderPlayerSessionClosedScreen();
+            } else {
+              isAuthenticated = false;
+              sessionStorage.clear();
+              state = getDefaultState();
+              state.status = 'setup';
+              try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+                localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
+              } catch (e) {}
+              render();
+            }
             break;
           }
 
@@ -571,18 +1248,6 @@
               try {
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
               } catch (e) {}
-              render();
-            }
-            break;
-          }
-
-          case 'GLOBAL_LOGOUT': {
-            isAuthenticated = false;
-            sessionStorage.removeItem(AUTH_KEY);
-            localStorage.removeItem('jeopardy_player_name');
-            if (currentRole === 'player') {
-              renderPlayerLoggedOutNotice();
-            } else {
               render();
             }
             break;
@@ -750,13 +1415,251 @@
         });
       }
 
-      // CIERRE DE SESIÓN GLOBAL
+      // CIERRE DE SESIÓN GLOBAL Y REINICIO COMPLETO DEL TABLERO
       function executeGlobalLogout() {
-        sound.playSelect();
+        sound.playWrong();
         isAuthenticated = false;
-        sessionStorage.removeItem(AUTH_KEY);
-        dispatchAction('GLOBAL_LOGOUT', {});
+        sessionStorage.clear();
+        localStorage.removeItem(AUTH_KEY);
+        localStorage.removeItem(STORAGE_KEY);
+        localStorage.removeItem(LEGACY_STORAGE_KEY);
+        localStorage.removeItem('jeopardy_player_name');
+        localStorage.removeItem('jeopardy_player_team');
+        localStorage.removeItem('jeopardy_player_id');
+        localStorage.removeItem('jeopardy_player_registered');
+
+        // Reinicio completo del estado global del tablero
+        state = getDefaultState();
+        state.status = 'setup';
+        state.teams.forEach(t => {
+          t.score = 0;
+          t.members = [];
+        });
+        state.categories.forEach(cat => {
+          cat.clues.forEach(cl => {
+            cl.isAnswered = false;
+            cl.answeredByTeamId = null;
+          });
+        });
+        state.activeClue = null;
+        state.buzzerState = {
+          isOpen: false,
+          buzzedTeamId: null,
+          buzzedPlayerName: null,
+          buzzedAt: null,
+          answerTimeLimit: 10,
+          answerTimeRemaining: 10,
+          playerAnswer: null,
+          lockedTeams: [],
+          firstAttemptTeamId: null,
+          hasReboundedToFirst: false,
+          attemptedMembers: []
+        };
+
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
+          localStorage.setItem(SYNC_EVENT_KEY, JSON.stringify({ action: 'GLOBAL_LOGOUT', type: 'SESSION_TERMINATED', payload: {}, ts: Date.now() }));
+        } catch (e) {}
+
+        // Notificar cierre de sesión en Firebase Realtime Database
+        if (fbDb) {
+          const sessionId = getFirebaseSessionId();
+          fbDb.ref(`sessions/${sessionId}/status`).set('closed').catch(err => console.warn('Firebase status closed error:', err));
+        }
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: 'GLOBAL_LOGOUT', action: 'GLOBAL_LOGOUT' }));
+          } catch (e) {}
+        }
+
+        if (window.location.protocol.startsWith('http')) {
+          fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+        }
+
+        dispatchAction('GLOBAL_LOGOUT', { type: 'SESSION_TERMINATED' });
         render();
+      }
+
+      // Pantalla informativa para dispositivos móviles al cerrarse la sesión del anfitrión
+      function renderPlayerSessionClosedScreen() {
+        const app = document.getElementById('app');
+        if (!app) return;
+        sound.playWrong();
+        app.innerHTML = `
+          <div class="min-h-screen flex items-center justify-center p-4 bg-gradient-to-b from-[#000533] via-[#020B4A] to-[#00021A] text-center">
+            <div class="w-full max-w-sm bg-[#000842] border-4 border-rose-500 rounded-3xl p-6 shadow-[0_0_50px_rgba(244,63,94,0.4)] space-y-4 animate-in zoom-in-95">
+              <div class="w-16 h-16 mx-auto rounded-2xl bg-rose-600/20 border-2 border-rose-500 flex items-center justify-center text-3xl">
+                🔒
+              </div>
+              <h2 class="text-xl font-black text-white uppercase font-cinzel">
+                Sesión Terminada
+              </h2>
+              <p class="text-xs text-blue-200 leading-relaxed">
+                El presentador ha cerrado la sesión del torneo. Tu dispositivo se ha desconectado del juego.
+              </p>
+              <button
+                id="btn-player-reconnect"
+                type="button"
+                class="w-full py-3.5 rounded-xl bg-gradient-to-r from-[#D4AF37] via-[#FFCC00] to-[#D4AF37] text-[#000533] font-black text-xs uppercase tracking-widest hover:brightness-110 active:scale-98 transition-all border-2 border-white cursor-pointer shadow"
+              >
+                Volver a Escanear / Ingresar
+              </button>
+            </div>
+          </div>
+        `;
+        document.getElementById('btn-player-reconnect')?.addEventListener('click', () => {
+          localStorage.removeItem('jeopardy_player_name');
+          localStorage.removeItem('jeopardy_player_team');
+          localStorage.removeItem('jeopardy_player_id');
+          localStorage.removeItem('jeopardy_player_registered');
+          render();
+        });
+      }
+
+      // Notificación global al cerrar la ventana/pestaña del anfitrión
+      window.addEventListener('beforeunload', () => {
+        if (currentRole === 'host' && isAuthenticated) {
+          try {
+            if (navigator.sendBeacon) {
+              navigator.sendBeacon('/api/auth/logout', JSON.stringify({ reason: 'beforeunload' }));
+            } else if (window.location.protocol.startsWith('http')) {
+              fetch('/api/auth/logout', { method: 'POST', keepalive: true }).catch(() => {});
+            }
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'GLOBAL_LOGOUT', action: 'GLOBAL_LOGOUT' }));
+            }
+            if (bc) bc.postMessage({ action: 'GLOBAL_LOGOUT', type: 'SESSION_TERMINATED', payload: {}, ts: Date.now() });
+            localStorage.setItem(SYNC_EVENT_KEY, JSON.stringify({ action: 'GLOBAL_LOGOUT', type: 'SESSION_TERMINATED', payload: {}, ts: Date.now() }));
+            hostConnections.forEach(c => {
+              if (c.open) c.send({ action: 'GLOBAL_LOGOUT', type: 'SESSION_TERMINATED', payload: {} });
+            });
+          } catch (e) {}
+        }
+      });
+
+      window.addEventListener('unload', () => {
+        if (currentRole === 'host') {
+          sessionStorage.clear();
+          localStorage.removeItem(AUTH_KEY);
+        }
+      });
+
+      // --- PARSERS DE PREGUNTAS (CSV Y JSON) ---
+      function parseQuestionsCSV(csvText) {
+        const firstLine = csvText.split('\n')[0] || '';
+        const delimiter = firstLine.includes(';') ? ';' : ',';
+
+        function parseCSVLine(text) {
+          const parts = [];
+          let cur = '';
+          let inQuote = false;
+          for (let i = 0; i < text.length; i++) {
+            const c = text[i];
+            if (c === '"') {
+              if (inQuote && text[i + 1] === '"') {
+                cur += '"';
+                i++;
+              } else {
+                inQuote = !inQuote;
+              }
+            } else if (c === delimiter && !inQuote) {
+              parts.push(cur.trim());
+              cur = '';
+            } else {
+              cur += c;
+            }
+          }
+          parts.push(cur.trim());
+          return parts;
+        }
+
+        const lines = csvText.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+        if (lines.length < 2) throw new Error('El archivo CSV está vacío o contiene muy pocas filas.');
+
+        const header = parseCSVLine(lines[0]).map(h => h.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''));
+        let catIdx = header.findIndex(h => h.includes('cat'));
+        let valIdx = header.findIndex(h => h.includes('val') || h.includes('punt') || h.includes('point'));
+        let qIdx = header.findIndex(h => h.includes('preg') || h.includes('quest') || h.includes('clue'));
+        let ansIdx = header.findIndex(h => h.includes('resp') || h.includes('ans'));
+
+        let startRow = 1;
+        if (catIdx === -1 || qIdx === -1) {
+          catIdx = 0; valIdx = 1; qIdx = 2; ansIdx = 3;
+          startRow = 0;
+        }
+
+        const categoryMap = new Map();
+        for (let i = startRow; i < lines.length; i++) {
+          const cols = parseCSVLine(lines[i]);
+          if (cols.length < 3) continue;
+          const catName = cols[catIdx] || 'General';
+          const rawVal = parseInt(cols[valIdx], 10);
+          const question = cols[qIdx];
+          const answer = cols[ansIdx] || 'Respuesta no provista';
+          if (!question) continue;
+
+          if (!categoryMap.has(catName)) {
+            categoryMap.set(catName, []);
+          }
+          const catClues = categoryMap.get(catName);
+          const value = !isNaN(rawVal) && rawVal > 0 ? rawVal : (catClues.length + 1) * 100;
+          catClues.push({
+            id: 'c' + (categoryMap.size) + '-' + value + '-' + (catClues.length + 1),
+            value: value,
+            question: question,
+            answer: answer,
+            isAnswered: false
+          });
+        }
+
+        if (categoryMap.size === 0) {
+          throw new Error('No se encontraron preguntas válidas en las filas del archivo CSV.');
+        }
+
+        const result = [];
+        let catNum = 1;
+        for (const [title, clues] of categoryMap.entries()) {
+          if (result.length >= 6) break;
+          clues.sort((a, b) => a.value - b.value);
+          result.push({
+            id: 'cat-' + catNum,
+            title: title,
+            clues: clues.slice(0, 5)
+          });
+          catNum++;
+        }
+        return result;
+      }
+
+      function downloadCSVTemplate() {
+        const sample = "Categoría,Valor,Pregunta,Respuesta\n" +
+          "Historia,100,¿En qué año llegó Cristóbal Colón a América?,1492\n" +
+          "Historia,200,¿Quién fue el libertador de varios países sudamericanos?,Simón Bolívar\n" +
+          "Historia,300,¿Qué imperio construyó el Coliseo Romano?,Imperio Romano\n" +
+          "Historia,400,¿En qué año concluyó la Segunda Guerra Mundial?,1945\n" +
+          "Historia,500,¿Qué pensador de la Ilustración propuso la división de poderes?,Montesquieu\n" +
+          "Ciencia,100,¿Cuál es el elemento químico más abundante del universo?,Hidrógeno\n" +
+          "Ciencia,200,¿Qué fuerza física atrae los cuerpos hacia la Tierra?,Gravedad\n" +
+          "Ciencia,300,¿Cuál es el orgánulo celular responsable de producir ATP?,Mitocondria\n" +
+          "Ciencia,400,¿Cuál es la velocidad estimada de la luz en km/s?,300.000 km/s\n" +
+          "Ciencia,500,¿Qué partícula del núcleo atómico no posee carga eléctrica?,Neutrón\n" +
+          "Geografía,100,¿Cuál es el río más caudaloso y largo del planeta?,Río Amazonas\n" +
+          "Geografía,200,¿Cuál es el país con mayor superficie territorial del mundo?,Rusia\n" +
+          "Geografía,300,¿Qué cordillera montañosa recorre la costa occidental de Sudamérica?,Los Andes\n" +
+          "Geografía,400,¿Cuál es la ciudad capital oficial de Australia?,Canberra\n" +
+          "Geografía,500,¿Cuál es el desierto no polar más seco del planeta?,Desierto de Atacama\n";
+
+        const blob = new Blob([sample], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'plantilla_preguntas_jeopardy.csv';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
       }
 
       // --- ROUTER DE INTERFAZ ---
@@ -778,6 +1681,11 @@
 
         if (state.status === 'setup') {
           renderSetupScreen(app);
+          return;
+        }
+
+        if (state.status === 'qrcodes') {
+          renderQRCodesScreen(app);
           return;
         }
 
@@ -875,6 +1783,22 @@
             sound.playCorrect();
             isAuthenticated = true;
             sessionStorage.setItem(AUTH_KEY, 'true');
+
+            // REGLA CRÍTICA 2: El presentador aterriza SIEMPRE en la Pantalla de Configuración Inicial (setup)
+            state.status = 'setup';
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+              localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
+            } catch (e) {}
+
+            if (window.location.protocol.startsWith('http')) {
+              fetch('/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: val })
+              }).catch(() => {});
+            }
+            dispatchAction('HOST_LOGIN', {});
             initNetworkSync();
             render();
           } else {
@@ -886,26 +1810,26 @@
         });
       }
 
-      // 2. PANTALLA DE CONFIGURACIÓN INICIAL (HASTA 5 EQUIPOS + LISTA EN TIEMPO REAL DE MIEMBROS + SIN SCROLL)
+      // 2. PANTALLA DE CONFIGURACIÓN INICIAL (ORDEN ESTRICTO: NOMBRE, CSV PREGUNTAS, EQUIPOS, LÍMITE)
       function renderSetupScreen(container) {
         const teamCount = state.teamCount || state.teams.length;
-        const baseUrl = window.location.href.split('?')[0];
+        const totalClues = state.categories.reduce((acc, c) => acc + c.clues.length, 0);
 
         container.innerHTML = `
-          <div class="h-screen flex flex-col bg-[#000533] p-2.5 sm:p-3 overflow-hidden">
-            <!-- Header Compacto -->
-            <header class="flex items-center justify-between bg-[#000222] border-2 border-[#D4AF37] rounded-2xl px-4 py-2 mb-2 shadow-md shrink-0">
+          <div class="min-h-screen flex flex-col bg-[#000533] p-3 sm:p-5">
+            <!-- Header Superior -->
+            <header class="flex items-center justify-between bg-[#000222] border-2 border-[#D4AF37] rounded-2xl px-4 sm:px-6 py-3 mb-4 shadow-lg shrink-0">
               <div class="flex items-center gap-3">
-                <div class="w-9 h-9 rounded-xl bg-[#060CE9] border-2 border-[#FFCC00] flex items-center justify-center font-cinzel text-xl font-black text-[#FFCC00]">
+                <div class="w-10 h-10 rounded-xl bg-[#060CE9] border-2 border-[#FFCC00] flex items-center justify-center font-cinzel text-xl font-black text-[#FFCC00] shadow">
                   J!
                 </div>
                 <div>
-                  <h1 class="text-base font-black text-white uppercase font-cinzel leading-none flex items-center gap-2">
-                    Configuración del Torneo
-                    <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse" title="Sincronización en vivo activa"></span>
+                  <h1 class="text-base sm:text-lg font-black text-white uppercase font-cinzel leading-none flex items-center gap-2">
+                    Configuración Inicial del Torneo
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
                   </h1>
-                  <span class="text-[11px] text-blue-200">
-                    Sala: <strong class="text-[#FFCC00] font-mono">${state.roomCode}</strong> • Participantes reflejados en tiempo real al escanear.
+                  <span class="text-xs text-blue-200">
+                    Paso 1 de 2 • Sala: <strong class="text-[#FFCC00] font-mono">${state.roomCode}</strong>
                   </span>
                 </div>
               </div>
@@ -918,215 +1842,238 @@
                 </button>
                 <button
                   id="btn-global-logout-setup"
-                  class="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-black text-xs uppercase border border-rose-400 cursor-pointer shadow"
+                  class="px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-black text-xs uppercase border border-rose-400 cursor-pointer shadow"
                 >
                   Cerrar Sesión Global
                 </button>
               </div>
             </header>
 
-            <!-- Panel de Controles de Equipos y Preguntas -->
-            <div class="bg-[#000842] border-2 border-blue-900/80 rounded-2xl p-3 mb-2 shrink-0 grid grid-cols-1 md:grid-cols-4 gap-3 items-center text-xs">
-              <div>
-                <label class="block font-black uppercase tracking-wider text-blue-200 mb-1 text-[11px]">
-                  Título del Concurso
-                </label>
-                <input
-                  id="setup-title-input"
-                  type="text"
-                  value="${state.title}"
-                  class="w-full py-1.5 px-2.5 rounded-lg bg-[#000324] border border-blue-600 text-white font-bold outline-none focus:border-[#FFCC00]"
-                />
-              </div>
+            <!-- Contenedor Principal de Formulario -->
+            <main class="flex-1 max-w-4xl mx-auto w-full space-y-4">
+              <form id="setup-form" class="space-y-4">
+                <!-- 1. Nombre de la Sesión -->
+                <div class="bg-[#000842] border-2 border-blue-900/80 rounded-2xl p-4 sm:p-5 shadow-md space-y-2">
+                  <label class="block font-black uppercase tracking-wider text-[#FFCC00] text-xs sm:text-sm font-cinzel">
+                    1. Nombre de la Sesión / Título del Concurso
+                  </label>
+                  <input
+                    id="setup-title-input"
+                    type="text"
+                    value="${state.title}"
+                    placeholder="Ej. Gran Torneo Jeopardy Live Show..."
+                    required
+                    class="w-full py-3 px-4 rounded-xl bg-[#000324] border-2 border-blue-600 text-white font-bold text-sm sm:text-base outline-none focus:border-[#FFCC00] transition-colors"
+                  />
+                  <p class="text-[11px] text-blue-300">
+                    Este título se mostrará en el encabezado del tablero y en los teléfonos de los participantes.
+                  </p>
+                </div>
 
-              <div>
-                <label class="block font-black uppercase tracking-wider text-blue-200 mb-1 text-[11px]">
-                  Equipos Participantes (1 a 5)
-                </label>
-                <div class="grid grid-cols-5 gap-1">
-                  ${[1, 2, 3, 4, 5].map(n => `
+                <!-- 2. Carga de Archivo CSV de Preguntas -->
+                <div class="bg-[#000842] border-2 border-blue-900/80 rounded-2xl p-4 sm:p-5 shadow-md space-y-3">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <label class="block font-black uppercase tracking-wider text-[#FFCC00] text-xs sm:text-sm font-cinzel">
+                        2. Cargar Preguntas del Concurso (Archivo CSV o JSON)
+                      </label>
+                      <p class="text-[11px] text-blue-300 mt-0.5">
+                        Soporta archivos CSV estándar (columnas: Categoría, Valor, Pregunta, Respuesta) o JSON.
+                      </p>
+                    </div>
                     <button
                       type="button"
-                      data-count="${n}"
-                      class="team-count-btn py-1 rounded-lg font-black text-xs uppercase border transition-all cursor-pointer ${
-                        teamCount === n
-                          ? 'bg-[#FFCC00] text-[#000533] border-white shadow'
-                          : 'bg-blue-950/70 text-blue-200 border-blue-800 hover:bg-blue-900'
-                      }"
+                      id="btn-download-csv-template"
+                      class="px-3 py-1.5 rounded-xl bg-blue-950 hover:bg-blue-900 text-blue-200 border border-blue-600 font-bold text-xs flex items-center gap-1.5 cursor-pointer shadow-sm"
                     >
-                      ${n}
+                      <span>📥</span> Descargar Plantilla CSV
                     </button>
-                  `).join('')}
-                </div>
-              </div>
+                  </div>
 
-              <div>
-                <label class="block font-black uppercase tracking-wider text-blue-200 mb-1 text-[11px]">
-                  Límite Miembros / Equipo
-                </label>
-                <select
-                  id="setup-max-members"
-                  class="w-full py-1.5 px-2 rounded-lg bg-[#000324] border border-blue-600 text-white font-bold outline-none focus:border-[#FFCC00]"
-                >
-                  <option value="1" ${state.maxMembersPerTeam === 1 ? 'selected' : ''}>1 Persona (Individual)</option>
-                  <option value="3" ${state.maxMembersPerTeam === 3 ? 'selected' : ''}>3 Personas</option>
-                  <option value="5" ${state.maxMembersPerTeam === 5 ? 'selected' : ''}>5 Personas</option>
-                  <option value="10" ${state.maxMembersPerTeam === 10 ? 'selected' : ''}>10 Personas</option>
-                  <option value="999" ${state.maxMembersPerTeam >= 999 ? 'selected' : ''}>Sin límite</option>
-                </select>
-              </div>
+                  <!-- Botones de Acción de Carga -->
+                  <div class="flex flex-wrap gap-2 pt-1">
+                    <label class="flex-1 min-w-[200px] cursor-pointer">
+                      <span class="block text-center py-3 px-4 rounded-xl bg-gradient-to-r from-blue-700 to-blue-600 hover:from-blue-600 hover:to-blue-500 border border-blue-400 font-black text-white text-xs sm:text-sm uppercase tracking-wider shadow cursor-pointer transition-all">
+                        📁 Seleccionar Archivo CSV o JSON
+                      </span>
+                      <input id="questions-file-input" type="file" accept=".csv, .json, text/csv, application/json" class="hidden" />
+                    </label>
 
-              <div class="flex items-end gap-2">
-                <label class="flex-1 cursor-pointer">
-                  <span class="block font-black uppercase tracking-wider text-blue-200 mb-1 text-[11px]">
-                    Subir Preguntas (JSON)
-                  </span>
-                  <span class="block text-center py-1.5 px-2 rounded-lg bg-blue-900/80 hover:bg-blue-800 border border-blue-600 font-bold text-white text-[11px] truncate">
-                    Examinar archivo
-                  </span>
-                  <input id="questions-file-input" type="file" accept=".json" class="hidden" />
-                </label>
-                <button
-                  id="btn-default-questions"
-                  type="button"
-                  title="Restaurar preguntas oficiales"
-                  class="py-1.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600 font-bold text-[11px] cursor-pointer"
-                >
-                  Por Defecto
-                </button>
-              </div>
-            </div>
+                    <button
+                      id="btn-default-questions"
+                      type="button"
+                      class="py-3 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600 font-bold text-xs uppercase cursor-pointer transition-colors"
+                    >
+                      Restaurar Preguntas Oficiales
+                    </button>
+                  </div>
 
-            <!-- ZONA DE CÓDIGOS QR DINÁMICOS Y MIEMBROS EN TIEMPO REAL (SIN SCROLL VERTICAL) -->
-            <div class="flex-1 bg-[#000222] border-2 border-blue-900/60 rounded-2xl p-2.5 flex flex-col justify-between overflow-hidden shadow-inner">
-              <div class="flex items-center justify-between pb-1.5 border-b border-blue-900/80 shrink-0">
-                <span class="text-xs font-black uppercase tracking-wider text-[#FFCC00] flex items-center gap-2">
-                  <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                  Códigos QR Dinámicos (Registro en Vivo por Equipo)
-                </span>
-                <span class="text-[11px] text-blue-300">
-                  Total Conectados: <strong class="text-white">${state.teams.slice(0, teamCount).reduce((acc, t) => acc + t.members.length, 0)} participantes</strong>
-                </span>
-              </div>
-
-              <!-- Rejilla autoajustable para 1 a 5 equipos sin scroll -->
-              <div
-                id="qr-cards-grid"
-                class="grid gap-2 my-1.5 flex-1 items-stretch"
-                style="grid-template-columns: repeat(${teamCount}, minmax(0, 1fr));"
-              >
-                ${state.teams.slice(0, teamCount).map((team, idx) => `
-                  <div
-                    class="team-qr-card rounded-xl border-2 flex flex-col items-center justify-between p-2 bg-[#000428] text-center shadow-lg transition-all overflow-hidden"
-                    style="border-color: ${team.color};"
-                  >
-                    <!-- Título de Equipo Editable -->
-                    <div class="w-full shrink-0">
-                      <div class="flex items-center justify-center gap-1 mb-0.5">
-                        <span class="w-2.5 h-2.5 rounded-full" style="background-color: ${team.color};"></span>
-                        <input
-                          type="text"
-                          data-team-index="${idx}"
-                          value="${team.name}"
-                          class="team-name-input bg-transparent text-white font-black text-xs sm:text-sm text-center outline-none border-b border-transparent focus:border-[#FFCC00] max-w-[130px]"
-                        />
-                      </div>
-                      <span class="text-[11px] font-mono font-bold block" style="color: ${team.color};">
-                        ${team.members.length} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} conectados
+                  <!-- Estado actual de las preguntas cargadas -->
+                  <div class="p-3.5 rounded-xl bg-[#000324] border border-blue-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
+                    <div class="flex items-center gap-2">
+                      <span class="w-3 h-3 rounded-full bg-emerald-400"></span>
+                      <span class="text-white font-bold">
+                        Categorías Activas: <strong class="text-[#FFCC00]">${state.categories.length}</strong> • Preguntas: <strong class="text-[#FFCC00]">${totalClues}</strong>
                       </span>
                     </div>
-
-                    <!-- Código QR Dinámico -->
-                    <div class="my-auto py-1 flex items-center justify-center shrink-0">
-                      <div
-                        id="qrcode-box-${team.id}"
-                        class="bg-white p-1.5 rounded-xl shadow-md border border-white inline-block flex items-center justify-center"
-                      ></div>
-                    </div>
-
-                    <!-- LISTA DE MIEMBROS CONECTADOS EN TIEMPO REAL -->
-                    <div class="w-full shrink-0 px-1 mb-1">
-                      <div class="text-[10px] uppercase font-black text-blue-300 tracking-wider mb-1 flex items-center justify-between">
-                        <span>Miembros:</span>
-                        <span class="text-[9px] text-emerald-400 font-bold font-mono">${team.members.length}</span>
-                      </div>
-                      <div class="flex flex-wrap gap-1 justify-center max-h-[50px] overflow-y-auto">
-                        ${team.members.length === 0 ? `
-                          <span class="text-[10px] text-blue-400/60 italic py-0.5">
-                            Esperando participante...
-                          </span>
-                        ` : team.members.map(m => `
-                          <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-900/90 text-white border border-blue-500 shadow-sm animate-in zoom-in-95">
-                            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                            <span class="truncate max-w-[70px]">${m.name}</span>
-                            <button
-                              type="button"
-                              data-team-id="${team.id}"
-                              data-member-id="${m.id}"
-                              class="btn-remove-member hover:text-rose-400 text-xs font-black ml-0.5"
-                              title="Remover participante"
-                            >×</button>
-                          </span>
-                        `).join('')}
-                      </div>
-                    </div>
-
-                    <!-- Botón de Copiar Enlace -->
-                    <div class="w-full shrink-0">
-                      <button
-                        type="button"
-                        data-team-id="${team.id}"
-                        class="btn-copy-team-link w-full py-1 rounded bg-blue-950 hover:bg-blue-900 border border-blue-700 text-blue-200 font-bold text-[10px] uppercase cursor-pointer"
-                      >
-                        Copiar Enlace
-                      </button>
+                    <div class="flex flex-wrap gap-1.5">
+                      ${state.categories.map(c => `
+                        <span class="px-2 py-0.5 rounded-lg bg-blue-950 border border-blue-700 text-[11px] font-bold text-blue-200">
+                          ${c.title} (${c.clues.length})
+                        </span>
+                      `).join('')}
                     </div>
                   </div>
-                `).join('')}
-              </div>
+                </div>
 
-              <!-- Botón Gigante de Inicio de Juego -->
-              <div class="shrink-0 pt-1">
-                <button
-                  id="btn-start-jeopardy-game"
-                  type="button"
-                  class="w-full py-3 sm:py-3.5 rounded-xl bg-gradient-to-r from-[#D4AF37] via-[#FFCC00] to-[#D4AF37] text-[#000533] font-black text-sm sm:text-base uppercase tracking-widest hover:brightness-110 active:scale-98 transition-all shadow-[0_0_30px_rgba(255,204,0,0.5)] border-2 border-white cursor-pointer"
-                >
-                  ¡Iniciar Tablero de Juego Jeopardy!
-                </button>
-              </div>
-            </div>
+                <!-- 3. Configuración de Equipos (Hasta 5) -->
+                <div class="bg-[#000842] border-2 border-blue-900/80 rounded-2xl p-4 sm:p-5 shadow-md space-y-3">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <label class="block font-black uppercase tracking-wider text-[#FFCC00] text-xs sm:text-sm font-cinzel">
+                      3. Número de Equipos Participantes (Hasta 5)
+                    </label>
+                    <span class="text-[11px] text-blue-300 font-bold">
+                      ${teamCount} Equipos Activos
+                    </span>
+                  </div>
+
+                  <div class="grid grid-cols-5 gap-2">
+                    ${[1, 2, 3, 4, 5].map(n => `
+                      <button
+                        type="button"
+                        data-count="${n}"
+                        class="team-count-btn py-3 rounded-xl font-black text-sm sm:text-base uppercase border-2 transition-all cursor-pointer ${
+                          teamCount === n
+                            ? 'bg-[#FFCC00] text-[#000533] border-white shadow-[0_0_15px_rgba(255,204,0,0.5)] scale-102'
+                            : 'bg-blue-950/70 text-blue-200 border-blue-800 hover:bg-blue-900'
+                        }"
+                      >
+                        ${n} ${n === 1 ? 'Equipo' : 'Equipos'}
+                      </button>
+                    `).join('')}
+                  </div>
+
+                  <!-- Personalización de Nombres de los Equipos Activos -->
+                  <div class="pt-2">
+                    <span class="text-[11px] font-bold text-blue-300 uppercase tracking-wider block mb-2">
+                      Personalizar Nombres de Equipos:
+                    </span>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+                      ${state.teams.slice(0, teamCount).map((team, idx) => `
+                        <div
+                          class="flex items-center gap-2 p-2 rounded-xl border-2 bg-[#000324]"
+                          style="border-color: ${team.color};"
+                        >
+                          <span class="w-3.5 h-3.5 rounded-full shrink-0" style="background-color: ${team.color};"></span>
+                          <input
+                            type="text"
+                            data-team-index="${idx}"
+                            value="${team.name}"
+                            class="team-name-input bg-transparent text-white font-bold text-xs w-full outline-none"
+                            placeholder="Nombre del equipo..."
+                          />
+                        </div>
+                      `).join('')}
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 4. Límite de Participantes por Equipo -->
+                <div class="bg-[#000842] border-2 border-blue-900/80 rounded-2xl p-4 sm:p-5 shadow-md space-y-2">
+                  <label class="block font-black uppercase tracking-wider text-[#FFCC00] text-xs sm:text-sm font-cinzel">
+                    4. Límite de Participantes por Equipo
+                  </label>
+                  <select
+                    id="setup-max-members"
+                    class="w-full py-3 px-4 rounded-xl bg-[#000324] border-2 border-blue-600 text-white font-bold text-sm outline-none focus:border-[#FFCC00]"
+                  >
+                    <option value="1" ${state.maxMembersPerTeam === 1 ? 'selected' : ''}>1 Persona por Equipo (Juego Individual)</option>
+                    <option value="2" ${state.maxMembersPerTeam === 2 ? 'selected' : ''}>Hasta 2 Personas (Parejas)</option>
+                    <option value="3" ${state.maxMembersPerTeam === 3 ? 'selected' : ''}>Hasta 3 Personas</option>
+                    <option value="5" ${state.maxMembersPerTeam === 5 ? 'selected' : ''}>Hasta 5 Personas (Recomendado)</option>
+                    <option value="10" ${state.maxMembersPerTeam === 10 ? 'selected' : ''}>Hasta 10 Personas</option>
+                    <option value="999" ${state.maxMembersPerTeam >= 999 ? 'selected' : ''}>Sin límite de participantes</option>
+                  </select>
+                </div>
+
+                <!-- 5. Códigos QR Dinámicos y Participantes Conectados en Vivo -->
+                <div class="bg-[#000842] border-2 border-blue-900/80 rounded-2xl p-4 sm:p-5 shadow-md space-y-3">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <label class="block font-black uppercase tracking-wider text-[#FFCC00] text-xs sm:text-sm font-cinzel">
+                        5. Conexión de Concursantes en Vivo (Códigos QR Dinámicos)
+                      </label>
+                      <p class="text-[11px] text-blue-300 mt-0.5">
+                        Los concursantes pueden escanear el QR correspondiente a su equipo desde aquí mismo o en la pantalla completa.
+                      </p>
+                    </div>
+                    <span id="setup-total-connected-count" class="text-xs font-bold px-3 py-1 rounded-full bg-blue-950 border border-blue-600 text-emerald-400 flex items-center gap-1.5 shadow">
+                      <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                      ${state.teams.slice(0, teamCount).reduce((acc, t) => acc + (t.members?.length || 0), 0)} Conectados
+                    </span>
+                  </div>
+
+                  <div class="grid gap-3 sm:gap-4 pt-2" style="grid-template-columns: repeat(${teamCount}, minmax(0, 1fr));">
+                    ${state.teams.slice(0, teamCount).map((team) => `
+                      <div class="rounded-xl border-2 p-3 bg-[#000428] text-center shadow flex flex-col items-center justify-between" style="border-color: ${team.color};">
+                        <div class="w-full pb-1 border-b border-blue-900/60 flex items-center justify-between">
+                          <span class="text-white font-black text-xs uppercase truncate">${team.name}</span>
+                          <span id="setup-team-count-${team.id}" class="text-[11px] font-mono font-bold" style="color: ${team.color};">
+                            ${team.members?.length || 0} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam}
+                          </span>
+                        </div>
+                        <div class="my-2 p-1.5 bg-white rounded-xl shadow inline-block">
+                          <div id="setup-qr-${team.id}" class="w-[90px] h-[90px] flex items-center justify-center"></div>
+                        </div>
+                        <div class="w-full bg-[#00021A] rounded-lg p-1.5 text-center min-h-[48px]">
+                          <span class="text-[9px] uppercase font-black text-blue-400 block mb-0.5">Registrados:</span>
+                          <div id="setup-team-members-${team.id}" class="flex flex-wrap gap-1 justify-center max-h-[48px] overflow-y-auto">
+                            ${(team.members || []).length === 0 ? `
+                              <span class="text-[10px] text-blue-400/60 italic py-1">Esperando...</span>
+                            ` : team.members.map(m => `
+                              <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900 text-white border border-blue-500 shadow-sm">
+                                ${m.name}
+                              </span>
+                            `).join('')}
+                          </div>
+                        </div>
+                      </div>
+                    `).join('')}
+                  </div>
+                </div>
+
+                <!-- Botones Principales de Acción -->
+                <div class="pt-2 pb-6 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    id="btn-goto-qrcodes-fullscreen"
+                    class="py-3.5 px-4 rounded-xl bg-blue-900/90 hover:bg-blue-800 text-blue-100 font-black text-xs sm:text-sm uppercase tracking-wider border-2 border-blue-600 cursor-pointer flex items-center justify-center gap-2 shadow transition-colors"
+                  >
+                    <span>Proyectar Códigos QR en Pantalla Completa</span>
+                    <span>⛶</span>
+                  </button>
+                  <button
+                    type="submit"
+                    class="py-3.5 px-4 rounded-xl bg-gradient-to-r from-[#D4AF37] via-[#FFCC00] to-[#D4AF37] text-[#000533] font-black text-xs sm:text-sm uppercase tracking-widest hover:brightness-110 active:scale-98 transition-all shadow-[0_0_25px_rgba(255,204,0,0.5)] border-2 border-white cursor-pointer flex items-center justify-center gap-2"
+                  >
+                    <span>¡Comenzar Concurso Jeopardy!</span>
+                    <span>▶</span>
+                  </button>
+                </div>
+              </form>
+            </main>
           </div>
         `;
 
-        // Generar los Códigos QR con la URL que incluye roomCode y teamId
-        state.teams.slice(0, teamCount).forEach((team) => {
-          const qrContainer = document.getElementById(`qrcode-box-${team.id}`);
-          if (qrContainer && typeof QRCode === 'function') {
-            qrContainer.innerHTML = '';
-            const playerTeamUrl = `${baseUrl}?role=player&room=${state.roomCode}&team=${team.id}`;
-            new QRCode(qrContainer, {
-              text: playerTeamUrl,
-              width: 95,
-              height: 95,
-              colorDark: '#000533',
-              colorLight: '#ffffff',
-              correctLevel: QRCode.CorrectLevel.M
-            });
-          }
-        });
-
-        // Eventos
+        // Eventos de la Pantalla de Configuración
         const titleInput = document.getElementById('setup-title-input');
-        titleInput.addEventListener('change', () => {
+        titleInput.addEventListener('input', () => {
           state.title = titleInput.value.trim() || 'Torneo Jeopardy';
-          persistState(state);
         });
 
         const maxMemSelect = document.getElementById('setup-max-members');
         maxMemSelect.addEventListener('change', () => {
           state.maxMembersPerTeam = parseInt(maxMemSelect.value, 10);
-          persistState(state);
         });
 
         document.querySelectorAll('.team-count-btn').forEach(btn => {
@@ -1138,7 +2085,7 @@
               return existing ? { ...existing } : { ...t };
             });
             state.teams = updatedTeams;
-            persistState(state);
+            render();
           });
         });
 
@@ -1147,9 +2094,280 @@
             const idx = parseInt(inp.getAttribute('data-team-index'), 10);
             if (state.teams[idx]) {
               state.teams[idx].name = inp.value.trim() || `Equipo ${idx + 1}`;
-              persistState(state);
             }
           });
+        });
+
+        // Descarga de Plantilla CSV
+        document.getElementById('btn-download-csv-template').addEventListener('click', () => {
+          sound.playSelect();
+          downloadCSVTemplate();
+        });
+
+        // Carga de Archivo (CSV o JSON)
+        const fileInput = document.getElementById('questions-file-input');
+        fileInput.addEventListener('change', (e) => {
+          const file = e.target.files[0];
+          if (!file) return;
+
+          const reader = new FileReader();
+          reader.onload = (evt) => {
+            const content = evt.target.result;
+            try {
+              let importedCats = null;
+              if (file.name.endsWith('.json') || content.trim().startsWith('[') || content.trim().startsWith('{')) {
+                importedCats = JSON.parse(content);
+                if (!Array.isArray(importedCats)) {
+                  throw new Error('El archivo JSON debe contener un arreglo de categorías.');
+                }
+              } else {
+                // Parsear como CSV
+                importedCats = parseQuestionsCSV(content);
+              }
+
+              if (importedCats && importedCats.length > 0) {
+                state.categories = importedCats;
+                sound.playCorrect();
+                alert(`¡Se cargaron exitosamente ${importedCats.length} categorías (${importedCats.reduce((acc, c) => acc + c.clues.length, 0)} preguntas en total)!`);
+                render();
+              } else {
+                alert('No se pudieron extraer categorías válidas del archivo provisto.');
+              }
+            } catch (err) {
+              sound.playWrong();
+              alert('Error al procesar el archivo de preguntas: ' + err.message);
+            }
+          };
+          reader.readAsText(file);
+        });
+
+        document.getElementById('btn-default-questions').addEventListener('click', () => {
+          if (confirm('¿Restaurar las 5 categorías oficiales por defecto?')) {
+            state.categories = JSON.parse(JSON.stringify(DEFAULT_CATEGORIES));
+            sound.playSelect();
+            render();
+          }
+        });
+
+        document.getElementById('btn-switch-player-view').addEventListener('click', () => {
+          currentRole = 'player';
+          render();
+        });
+
+        document.getElementById('btn-global-logout-setup').addEventListener('click', () => {
+          executeGlobalLogout();
+        });
+
+        // Renderizado de códigos QR dentro del panel de configuración
+        const baseUrl = window.location.href.split('?')[0];
+        state.teams.slice(0, teamCount).forEach((team) => {
+          const qrContainer = document.getElementById(`setup-qr-${team.id}`);
+          if (qrContainer && typeof QRCode === 'function') {
+            qrContainer.innerHTML = '';
+            const playerTeamUrl = `${baseUrl}?role=player&room=${state.roomCode}&team=${team.id}`;
+            new QRCode(qrContainer, {
+              text: playerTeamUrl,
+              width: 85,
+              height: 85,
+              colorDark: '#000533',
+              colorLight: '#ffffff',
+              correctLevel: QRCode.CorrectLevel.M
+            });
+          }
+        });
+
+        // Botón de proyección en pantalla completa de códigos QR
+        document.getElementById('btn-goto-qrcodes-fullscreen')?.addEventListener('click', () => {
+          sound.playSelect();
+          state.title = titleInput.value.trim() || 'Torneo Jeopardy';
+          state.maxMembersPerTeam = parseInt(maxMemSelect.value, 10);
+          state.status = 'qrcodes';
+          persistState(state);
+        });
+
+        // Envío del Formulario -> Inicia directamente el Torneo Jeopardy
+        document.getElementById('setup-form').addEventListener('submit', (e) => {
+          e.preventDefault();
+          sound.playSelect();
+          state.title = titleInput.value.trim() || 'Torneo Jeopardy';
+          state.maxMembersPerTeam = parseInt(maxMemSelect.value, 10);
+          state.status = 'game';
+          persistState(state);
+        });
+      }
+
+      // 3. PANTALLA DE CÓDIGOS QR DINÁMICOS Y REGISTRO EN TIEMPO REAL
+      function renderQRCodesScreen(container) {
+        const teamCount = state.teamCount || state.teams.length;
+        const activeTeams = state.teams.slice(0, teamCount);
+        const baseUrl = window.location.href.split('?')[0];
+        const totalConnected = activeTeams.reduce((acc, t) => acc + t.members.length, 0);
+
+        container.innerHTML = `
+          <div class="min-h-screen flex flex-col justify-between bg-[#000533] p-3 sm:p-5">
+            <!-- Header -->
+            <header class="flex flex-wrap items-center justify-between gap-3 bg-[#000222] border-2 border-[#D4AF37] rounded-2xl px-4 sm:px-6 py-2.5 shadow-lg shrink-0">
+              <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-xl bg-[#060CE9] border-2 border-[#FFCC00] flex items-center justify-center font-cinzel text-xl font-black text-[#FFCC00] shadow">
+                  J!
+                </div>
+                <div>
+                  <h1 class="text-base sm:text-lg font-black text-white uppercase font-cinzel leading-none flex items-center gap-2">
+                    ${state.title}
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
+                  </h1>
+                  <span class="text-xs text-blue-200">
+                    Paso 2 de 2: Códigos QR Dinámicos • Sala: <strong class="text-[#FFCC00] font-mono">${state.roomCode}</strong>
+                  </span>
+                </div>
+              </div>
+
+              <div class="flex items-center gap-2">
+                <button
+                  id="btn-back-to-setup"
+                  class="px-3 py-1.5 rounded-xl bg-blue-900/80 hover:bg-blue-800 text-blue-200 font-bold text-xs uppercase border border-blue-700 cursor-pointer"
+                >
+                  ← Modificar Configuración
+                </button>
+                <button
+                  id="btn-global-logout-qr"
+                  class="px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-black text-xs uppercase border border-rose-400 cursor-pointer shadow"
+                >
+                  Cerrar Sesión Global
+                </button>
+              </div>
+            </header>
+
+            <!-- Subtítulo e instrucciones -->
+            <div class="text-center my-2 shrink-0">
+              <h2 class="text-base sm:text-xl font-black uppercase tracking-wider text-[#FFCC00] font-cinzel">
+                Registro de Equipos con Códigos QR
+              </h2>
+              <p class="text-xs sm:text-sm text-blue-200 mt-0.5">
+                Pide a los participantes que escaneen el código QR de su equipo desde su teléfono móvil para registrarse.
+              </p>
+            </div>
+
+            <!-- Rejilla de Tarjetas de Equipos con Códigos QR Dinámicos -->
+            <div
+              id="qr-cards-grid"
+              class="grid gap-3 sm:gap-4 my-auto flex-1 items-stretch max-w-7xl mx-auto w-full"
+              style="grid-template-columns: repeat(${teamCount}, minmax(0, 1fr));"
+            >
+              ${activeTeams.map((team, idx) => `
+                <div
+                  class="team-qr-card rounded-2xl border-4 flex flex-col items-center justify-between p-3 sm:p-4 bg-[#000428] text-center shadow-xl transition-all"
+                  style="border-color: ${team.color};"
+                >
+                  <!-- Cabecera de Equipo -->
+                  <div class="w-full shrink-0 pb-2 border-b border-blue-900/60">
+                    <div class="flex items-center justify-center gap-1.5 mb-1">
+                      <span class="w-3 h-3 rounded-full" style="background-color: ${team.color};"></span>
+                      <span class="text-white font-black text-xs sm:text-base uppercase tracking-wider truncate">
+                        ${team.name}
+                      </span>
+                    </div>
+                    <span id="qr-team-count-${team.id}" class="text-xs font-mono font-bold block" style="color: ${team.color};">
+                      ${team.members.length} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} registrados
+                    </span>
+                  </div>
+
+                  <!-- Código QR Dinámico Nítido -->
+                  <div class="my-auto py-2 flex items-center justify-center">
+                    <div
+                      id="qrcode-box-${team.id}"
+                      class="bg-white p-2 sm:p-2.5 rounded-2xl shadow-lg border border-white inline-block"
+                    ></div>
+                  </div>
+
+                  <!-- Lista de Miembros en Tiempo Real -->
+                  <div class="w-full shrink-0 my-1 bg-[#00021A] rounded-xl p-2 border border-blue-950">
+                    <div class="text-[10px] uppercase font-black text-blue-300 tracking-wider mb-1 flex items-center justify-between">
+                      <span>Participantes:</span>
+                      <span id="qr-team-badge-count-${team.id}" class="text-emerald-400 font-bold font-mono">${team.members.length}</span>
+                    </div>
+                    <div id="qr-team-members-${team.id}" class="flex flex-wrap gap-1 justify-center max-h-[70px] overflow-y-auto">
+                      ${team.members.length === 0 ? `
+                        <span class="text-[11px] text-blue-400/60 italic py-1">
+                          Esperando participantes...
+                        </span>
+                      ` : team.members.map(m => `
+                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-900/90 text-white border border-blue-500 shadow-sm animate-in zoom-in-95">
+                          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                          <span class="truncate max-w-[80px]">${m.name}</span>
+                          <button
+                            type="button"
+                            data-team-id="${team.id}"
+                            data-member-id="${m.id}"
+                            class="btn-remove-member hover:text-rose-400 text-xs font-black ml-0.5 cursor-pointer"
+                            title="Remover participante"
+                          >×</button>
+                        </span>
+                      `).join('')}
+                    </div>
+                  </div>
+
+                  <!-- Botón de Copiar Enlace Directo -->
+                  <div class="w-full shrink-0 pt-1">
+                    <button
+                      type="button"
+                      data-team-id="${team.id}"
+                      class="btn-copy-team-link w-full py-1.5 rounded-lg bg-blue-950 hover:bg-blue-900 border border-blue-700 text-blue-200 font-bold text-[11px] uppercase cursor-pointer transition-colors"
+                    >
+                      Copiar Enlace
+                    </button>
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+
+            <!-- Barra Inferior de Inicio de Tablero -->
+            <div class="mt-4 pt-3 border-t-2 border-blue-900/80 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
+              <div class="text-xs sm:text-sm text-blue-200 flex items-center gap-2">
+                <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                <span>
+                  Total Concursantes Conectados: <strong id="qr-total-connected-count" class="text-[#FFCC00] font-mono text-base">${totalConnected}</strong>
+                </span>
+              </div>
+
+              <button
+                id="btn-start-jeopardy-game"
+                type="button"
+                class="w-full sm:w-auto px-8 py-3.5 rounded-2xl bg-gradient-to-r from-[#D4AF37] via-[#FFCC00] to-[#D4AF37] text-[#000533] font-black text-sm sm:text-base uppercase tracking-widest hover:brightness-110 active:scale-98 transition-all shadow-[0_0_35px_rgba(255,204,0,0.6)] border-2 border-white cursor-pointer flex items-center justify-center gap-2"
+              >
+                <span>¡Iniciar Tablero de Juego Jeopardy!</span>
+                <span>🚀</span>
+              </button>
+            </div>
+          </div>
+        `;
+
+        // Renderizado de códigos QR con la URL del móvil y equipo
+        activeTeams.forEach((team) => {
+          const qrContainer = document.getElementById(`qrcode-box-${team.id}`);
+          if (qrContainer && typeof QRCode === 'function') {
+            qrContainer.innerHTML = '';
+            const playerTeamUrl = `${baseUrl}?role=player&room=${state.roomCode}&team=${team.id}`;
+            new QRCode(qrContainer, {
+              text: playerTeamUrl,
+              width: 105,
+              height: 105,
+              colorDark: '#000533',
+              colorLight: '#ffffff',
+              correctLevel: QRCode.CorrectLevel.M
+            });
+          }
+        });
+
+        // Eventos
+        document.getElementById('btn-back-to-setup').addEventListener('click', () => {
+          sound.playSelect();
+          state.status = 'setup';
+          persistState(state);
+        });
+
+        document.getElementById('btn-global-logout-qr').addEventListener('click', () => {
+          executeGlobalLogout();
         });
 
         document.querySelectorAll('.btn-remove-member').forEach(btn => {
@@ -1170,49 +2388,6 @@
               setTimeout(() => { btn.textContent = prev; }, 1500);
             });
           });
-        });
-
-        // Subida de preguntas personalizadas
-        const fileInput = document.getElementById('questions-file-input');
-        fileInput.addEventListener('change', (e) => {
-          const file = e.target.files[0];
-          if (!file) return;
-          const reader = new FileReader();
-          reader.onload = (evt) => {
-            try {
-              const importedCats = JSON.parse(evt.target.result);
-              if (Array.isArray(importedCats) && importedCats.length > 0) {
-                state.categories = importedCats;
-                sound.playCorrect();
-                alert(`¡Se cargaron exitosamente ${importedCats.length} categorías!`);
-                persistState(state);
-              } else {
-                alert('El archivo no tiene el formato esperado de categorías.');
-              }
-            } catch (err) {
-              alert('Error al leer el archivo JSON: ' + err.message);
-            }
-          };
-          reader.readAsText(file);
-        });
-
-        document.getElementById('btn-default-questions').addEventListener('click', () => {
-          if (confirm('¿Restaurar las 5 categorías oficiales por defecto?')) {
-            state.categories = JSON.parse(JSON.stringify(DEFAULT_CATEGORIES));
-            sound.playSelect();
-            persistState(state);
-          }
-        });
-
-        document.getElementById('btn-switch-player-view').addEventListener('click', () => {
-          currentRole = 'player';
-          render();
-        });
-
-        document.getElementById('btn-global-logout-setup').addEventListener('click', () => {
-          if (confirm('¿Cerrar sesión global? Se bloqueará la pantalla y se expulsará a los dispositivos móviles.')) {
-            executeGlobalLogout();
-          }
         });
 
         document.getElementById('btn-start-jeopardy-game').addEventListener('click', () => {
@@ -1292,6 +2467,12 @@
 
               <!-- Controles del Anfitrión -->
               <div class="flex items-center gap-2">
+                <button
+                  id="btn-view-qrcodes"
+                  class="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs uppercase border border-amber-300 cursor-pointer shadow"
+                >
+                  Ver Códigos QR
+                </button>
                 <button
                   id="btn-return-setup"
                   class="px-3 py-1.5 rounded-xl bg-blue-900/80 hover:bg-blue-800 text-blue-200 font-bold text-xs uppercase border border-blue-700 cursor-pointer"
@@ -1398,29 +2579,23 @@
           });
         });
 
+        document.getElementById('btn-view-qrcodes')?.addEventListener('click', () => {
+          sound.playSelect();
+          state.status = 'qrcodes';
+          persistState(state);
+        });
+
         document.getElementById('btn-return-setup').addEventListener('click', () => {
           state.status = 'setup';
           persistState(state);
         });
 
-        document.getElementById('btn-reset-board').addEventListener('click', () => {
-          if (confirm('¿Deseas reiniciar las pistas contestadas del tablero?')) {
-            const resetCats = state.categories.map(c => ({
-              ...c,
-              clues: c.clues.map(cl => ({ ...cl, isAnswered: false }))
-            }));
-            const resetTeams = state.teams.map(t => ({ ...t, score: 0 }));
-            state.categories = resetCats;
-            state.teams = resetTeams;
-            state.activeClue = null;
-            persistState(state);
-          }
+        document.getElementById('btn-reset-board')?.addEventListener('click', () => {
+          executeResetBoard();
         });
 
         document.getElementById('btn-global-logout-game').addEventListener('click', () => {
-          if (confirm('¿Confirmas el cierre de sesión global? Se bloqueará la pantalla y desconectará a los teléfonos.')) {
-            executeGlobalLogout();
-          }
+          executeGlobalLogout();
         });
 
         if (state.activeClue) {
@@ -1598,17 +2773,35 @@
         if (btnCloseX) btnCloseX.addEventListener('click', closeModal);
       }
 
+      // Estado local persistente para el input de respuesta móvil (evita pérdida de foco y cierres de teclado)
+      let playerLocalAnswer = '';
+
+      function escapeHtml(str) {
+        if (!str) return '';
+        return String(str)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#039;');
+      }
+
       // 4. VISTA MÓVIL DEL JUGADOR
       function renderPlayerView(container) {
         const teamCount = state.teamCount || state.teams.length;
         const availableTeams = state.teams.slice(0, teamCount);
         let myTeamId = assignedTeamId || localStorage.getItem('jeopardy_player_team') || availableTeams[0]?.id;
         let myName = localStorage.getItem('jeopardy_player_name') || '';
+        const assignedTeam = availableTeams.find(t => t.id === assignedTeamId);
 
+        // Caso 1: Participante no registrado aún
         if (!myName) {
+          if (document.getElementById('player-join-form')) {
+            return;
+          }
           container.innerHTML = `
-            <div class="min-h-screen bg-gradient-to-b from-[#000533] via-[#020B4A] to-[#00021A] p-4 flex items-center justify-center">
-              <div class="w-full max-w-sm bg-[#000842] border-4 border-[#FFCC00] rounded-3xl p-6 text-center space-y-5 shadow-2xl animate-in zoom-in-95">
+            <div class="min-h-screen bg-gradient-to-b from-[#000533] via-[#020B4A] to-[#00021A] p-4 flex items-center justify-center overflow-y-auto pb-16">
+              <div class="w-full max-w-sm bg-[#000842] border-4 border-[#FFCC00] rounded-3xl p-6 text-center space-y-4 shadow-2xl animate-in zoom-in-95">
                 <div class="w-16 h-16 mx-auto rounded-2xl bg-[#060CE9] border-2 border-[#FFCC00] flex items-center justify-center font-cinzel text-3xl font-black text-[#FFCC00]">
                   J!
                 </div>
@@ -1618,18 +2811,33 @@
                     <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
                   </h2>
                   <p class="text-xs text-blue-200 mt-1">
-                    Sala: <strong class="text-[#FFCC00] font-mono">${roomCodeParam}</strong> • Únete a tu equipo para concursar.
+                    Sala: <strong class="text-[#FFCC00] font-mono">${roomCodeParam || state.roomCode}</strong>
                   </p>
                 </div>
+
+                ${assignedTeam ? `
+                  <div
+                    class="p-3 rounded-2xl border-2 text-center shadow-inner"
+                    style="background-color: ${assignedTeam.color}22; border-color: ${assignedTeam.color};"
+                  >
+                    <span class="text-[10px] font-black uppercase text-blue-200 block tracking-wider">
+                      Equipo asignado por QR:
+                    </span>
+                    <span class="text-base font-black uppercase tracking-wider block mt-0.5" style="color: ${assignedTeam.color};">
+                      ${assignedTeam.name}
+                    </span>
+                  </div>
+                ` : ''}
 
                 <form id="player-join-form" class="space-y-4 text-left">
                   <div>
                     <label class="block text-[11px] font-black uppercase tracking-wider text-blue-200 mb-1">
-                      Selecciona tu Equipo
+                      Selecciona o Confirma tu Equipo
                     </label>
                     <select
                       id="player-team-select"
-                      class="w-full py-3 px-3 rounded-xl bg-[#000324] border-2 border-blue-500 text-white font-bold text-sm outline-none focus:border-[#FFCC00]"
+                      class="w-full py-3 px-3 rounded-xl bg-[#000324] border-2 border-blue-500 text-white font-bold text-base outline-none focus:border-[#FFCC00]"
+                      style="font-size: 16px !important;"
                     >
                       ${availableTeams.map(t => `
                         <option value="${t.id}" ${t.id === myTeamId ? 'selected' : ''}>
@@ -1641,20 +2849,23 @@
 
                   <div>
                     <label class="block text-[11px] font-black uppercase tracking-wider text-blue-200 mb-1">
-                      Tu Nombre
+                      Tu Nombre o Apodo
                     </label>
                     <input
                       id="player-name-input"
                       type="text"
                       placeholder="Ej. Sofía, Alejandro..."
                       required
-                      class="w-full py-3 px-3 rounded-xl bg-[#000324] border-2 border-blue-500 text-white font-bold text-sm outline-none focus:border-[#FFCC00]"
+                      autocomplete="name"
+                      class="w-full py-3 px-3 rounded-xl bg-[#000324] border-2 border-blue-500 text-white font-bold text-base outline-none focus:border-[#FFCC00]"
+                      style="font-size: 16px !important; min-height: 48px; user-select: text; -webkit-user-select: text;"
                     />
                   </div>
 
                   <button
                     type="submit"
-                    class="w-full py-3.5 rounded-xl bg-[#FFCC00] hover:bg-yellow-300 text-[#000533] font-black text-sm uppercase tracking-widest shadow-lg cursor-pointer"
+                    class="w-full py-3.5 rounded-xl bg-[#FFCC00] hover:bg-yellow-300 text-[#000533] font-black text-sm uppercase tracking-widest shadow-lg cursor-pointer transition-transform active:scale-98"
+                    style="min-height: 48px;"
                   >
                     Ingresar al Concurso
                   </button>
@@ -1676,151 +2887,419 @@
             const chosenTeam = document.getElementById('player-team-select').value;
             if (!chosenName) return;
 
+            const activeRoom = roomCodeParam || state.roomCode || 'JP-2025';
+            const memberId = 'm-' + Date.now();
+
             localStorage.setItem('jeopardy_player_name', chosenName);
             localStorage.setItem('jeopardy_player_team', chosenTeam);
+            localStorage.setItem('jeopardy_player_id', memberId);
+            localStorage.setItem('jeopardy_player_room', activeRoom);
+            localStorage.setItem('jeopardy_player_registered', 'true');
 
-            const memberId = 'm-' + Date.now();
-            dispatchAction('PLAYER_JOIN', {
+            // 1. Cargar el estado más reciente de localStorage para no sobreescribir datos del anfitrión
+            let freshState = state;
+            try {
+              const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
+              if (raw) freshState = JSON.parse(raw);
+            } catch (err) {}
+
+            // 2. Limpiar duplicados del participante en otros equipos
+            freshState.teams = (freshState.teams || []).map(t => ({
+              ...t,
+              members: (t.members || []).filter(m => m.name.toLowerCase() !== chosenName.toLowerCase() && m.id !== memberId)
+            }));
+
+            // 3. Agregar el participante al equipo seleccionado (por ID o por nombre)
+            let targetTeam = freshState.teams.find(t => 
+              t.id === chosenTeam || 
+              t.name.toLowerCase() === chosenTeam.toLowerCase() ||
+              t.id.toLowerCase() === chosenTeam.toLowerCase()
+            );
+            if (!targetTeam && freshState.teams.length > 0) targetTeam = freshState.teams[0];
+            if (targetTeam) {
+              if (!targetTeam.members) targetTeam.members = [];
+              targetTeam.members.push({
+                id: memberId,
+                name: chosenName,
+                joinedAt: Date.now()
+              });
+            }
+            freshState.lastUpdated = Date.now();
+            state = freshState;
+
+            // 4. Guardar sincrónicamente en la clave unificada de localStorage
+            const joinPayload = {
               teamId: chosenTeam,
+              playerName: chosenName,
               memberName: chosenName,
-              memberId: memberId
-            });
+              sessionId: memberId,
+              memberId: memberId,
+              roomCode: activeRoom
+            };
 
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(freshState));
+              localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(freshState));
+              localStorage.setItem(SYNC_TRIGGER_KEY, JSON.stringify({
+                action: 'PLAYER_JOIN',
+                ...joinPayload,
+                ts: Date.now()
+              }));
+              localStorage.setItem(SYNC_EVENT_KEY, JSON.stringify({
+                action: 'PLAYER_JOIN',
+                payload: joinPayload,
+                ts: Date.now()
+              }));
+            } catch (err) {}
+
+            // 5. Propagar inmediatamente a través de BroadcastChannel
+            try {
+              if (bc) {
+                bc.postMessage({
+                  action: 'PLAYER_JOIN',
+                  payload: joinPayload,
+                  state: freshState,
+                  ts: Date.now()
+                });
+              }
+            } catch (err) {}
+
+            // 6. Notificación HTTP inmediata al backend REST /api/game/join
+            if (window.location.protocol.startsWith('http')) {
+              fetch('/api/game/join', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(joinPayload)
+              })
+              .then(res => res.json())
+              .then(data => {
+                if (data && data.state) {
+                  applyServerState(data.state);
+                }
+              })
+              .catch(() => {});
+            }
+
+            // 7. Sincronización en Firebase Realtime Database
+            // Ruta requerida: /sessions/{sessionId}/teams/{teamColor}/players
+            if (fbDb) {
+              const sessionId = getFirebaseSessionId();
+              const teamColorKey = getTeamColorKey(targetTeam);
+              fbDb.ref(`sessions/${sessionId}/teams/${teamColorKey}/players/${memberId}`).set({
+                id: memberId,
+                name: chosenName,
+                joinedAt: Date.now()
+              }).catch(err => console.warn('Firebase push player error:', err));
+            }
+
+            // 8. Notificar por WebSocket y WebRTC P2P
+            dispatchAction('PLAYER_JOIN', joinPayload);
+
+            sound.playJoin();
             render();
           });
           return;
         }
 
+        // Caso 2: Participante ya registrado (Pantalla Activa del Pulsador Móvil)
         const myTeam = state.teams.find(t => t.id === myTeamId) || state.teams[0];
-        const b = state.buzzerState;
-        const isBuzzerOpen = b.isOpen;
+        const b = state.buzzerState || {};
+        const isBuzzerOpen = !!b.isOpen;
         const isMyTeamBuzzed = b.buzzedTeamId === myTeam.id;
         const isLocked = (b.lockedTeams || []).includes(myTeam.id);
 
-        container.innerHTML = `
-          <div class="min-h-screen bg-[#000533] flex flex-col justify-between p-4 max-w-md mx-auto">
-            <div class="flex items-center justify-between bg-[#000842] border-2 border-blue-800 rounded-2xl p-3 shadow-md">
-              <div class="flex items-center gap-2.5">
-                <span class="w-4 h-4 rounded-full" style="background-color: ${myTeam.color};"></span>
-                <div>
-                  <span class="text-xs font-black text-white block uppercase tracking-wider">${myTeam.name}</span>
-                  <span class="text-[11px] text-blue-300 font-bold">${myName}</span>
+        // 1. Asegurar contenedor estructural persistente (evita que se desmonte el layout)
+        let mainContainer = document.getElementById('player-main-container');
+        if (!mainContainer) {
+          container.innerHTML = `
+            <div id="player-main-container" class="min-h-screen bg-[#000533] flex flex-col justify-between p-4 max-w-md mx-auto overflow-y-auto pb-28 overscroll-contain">
+              <!-- Barra superior del Jugador -->
+              <div class="space-y-2 shrink-0">
+                <div class="flex items-center justify-between bg-[#000842] border-2 border-blue-800 rounded-2xl p-3 shadow-md">
+                  <div class="flex items-center gap-2.5">
+                    <span id="player-badge-color" class="w-4 h-4 rounded-full shadow" style="background-color: ${myTeam.color};"></span>
+                    <div>
+                      <span id="player-badge-team-name" class="text-xs font-black text-white block uppercase tracking-wider">${myTeam.name}</span>
+                      <span class="text-[11px] text-blue-300 font-bold">Jugador: <strong class="text-white">${myName}</strong></span>
+                    </div>
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
+                    <button
+                      id="btn-player-change-team"
+                      type="button"
+                      class="text-[11px] text-blue-300 hover:text-white underline font-bold cursor-pointer"
+                    >
+                      Cambiar
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Banner de Confirmación Visual Inmediata -->
+                <div class="p-3 rounded-2xl bg-emerald-950/80 border-2 border-emerald-400 text-center shadow-lg">
+                  <div class="flex items-center justify-center gap-1.5 text-emerald-400 font-black text-xs uppercase tracking-wider">
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+                    ✓ ¡REGISTRADO EXITOSAMENTE!
+                  </div>
+                  <p class="text-xs font-bold text-white mt-0.5">
+                    Enlazado a Sala: <strong class="text-[#FFCC00] font-mono">${roomCodeParam || state.roomCode}</strong> • Equipo: <strong id="player-banner-team-name" style="color: ${myTeam.color};">${myTeam.name}</strong>
+                  </p>
+                  <p class="text-[11px] text-emerald-300 mt-0.5">
+                    Tu nombre ya está visible en el ordenador del presentador.
+                  </p>
                 </div>
               </div>
-              <div class="flex items-center gap-2">
-                <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
-                <button
-                  id="btn-player-change-team"
-                  class="text-[11px] text-blue-300 hover:text-white underline font-bold"
-                >
-                  Cambiar
-                </button>
+
+              <!-- Área Central del Pulsador / Respuesta Móvil -->
+              <div id="player-center-stage" class="my-auto py-4 text-center shrink-0"></div>
+
+              <!-- Pie de página -->
+              <div class="text-center pt-2 shrink-0">
+                <a href="?" class="text-xs text-blue-400 hover:text-white underline">
+                  Volver a Modo Anfitrión
+                </a>
               </div>
             </div>
+          `;
 
-            <div class="my-auto py-6 text-center">
-              ${isMyTeamBuzzed ? `
-                <div class="bg-white border-4 border-[#FFCC00] rounded-3xl p-5 shadow-[0_0_40px_rgba(255,204,0,0.6)] space-y-3 text-blue-950 animate-in zoom-in-95">
-                  <span class="text-2xl font-black uppercase font-cinzel block text-amber-600">
-                    ¡TIENES EL TURNO!
-                  </span>
-
-                  ${b.playerAnswer ? `
-                    <div class="p-3 rounded-xl bg-emerald-100 border border-emerald-400 text-emerald-800 text-xs font-bold">
-                      ✓ Respuesta transmitida al anfitrión: <strong class="text-sm">"${b.playerAnswer}"</strong>
-                    </div>
-                  ` : `
-                    <div class="p-2.5 rounded-xl bg-amber-50 border-2 border-amber-300">
-                      <div class="flex items-center justify-between text-xs font-black text-amber-900 mb-1">
-                        <span>Tiempo para escribir:</span>
-                        <span class="font-mono text-sm font-black px-2 py-0.5 rounded bg-amber-500 text-white">
-                          ${b.answerTimeRemaining ?? 10}s
-                        </span>
-                      </div>
-                      <div class="w-full bg-amber-200 h-2 rounded-full overflow-hidden">
-                        <div
-                          class="h-full bg-amber-600 transition-all duration-1000 ease-linear rounded-full"
-                          style="width: ${((b.answerTimeRemaining ?? 10) / 10) * 100}%;"
-                        ></div>
-                      </div>
-                    </div>
-
-                    <form id="player-answer-form" class="space-y-3">
-                      <input
-                        id="player-answer-input"
-                        type="text"
-                        placeholder="Escribe tu respuesta aquí..."
-                        required
-                        autofocus
-                        class="w-full py-3 px-3 rounded-xl border-2 border-blue-950 font-bold text-sm text-blue-950 outline-none focus:border-amber-500"
-                      />
-                      <button
-                        type="submit"
-                        class="w-full py-3 rounded-xl bg-[#FFCC00] hover:bg-yellow-300 text-[#000533] font-black text-xs uppercase tracking-wider shadow cursor-pointer"
-                      >
-                        Enviar Respuesta (10s)
-                      </button>
-                    </form>
-                  `}
-                </div>
-              ` : `
-                <div>
-                  <button
-                    id="btn-player-buzz"
-                    ${!isBuzzerOpen || isLocked ? 'disabled' : ''}
-                    class="w-60 h-60 mx-auto rounded-full border-8 font-cinzel font-black text-3xl uppercase tracking-widest shadow-2xl transition-all flex flex-col items-center justify-center cursor-pointer select-none active:scale-95 ${
-                      isLocked
-                        ? 'bg-slate-800 border-slate-600 text-slate-500 cursor-not-allowed'
-                        : isBuzzerOpen
-                        ? 'bg-rose-600 hover:bg-rose-500 border-yellow-400 text-white shadow-[0_0_60px_rgba(225,29,72,0.8)] animate-pulse'
-                        : 'bg-blue-950 border-blue-800 text-blue-400/50 cursor-not-allowed'
-                    }"
-                  >
-                    <span>${isLocked ? 'BLOQUEADO' : isBuzzerOpen ? '¡PULSAR!' : 'EN ESPERA'}</span>
-                    <span class="text-[11px] font-sans font-bold tracking-normal opacity-80 mt-1">
-                      ${isLocked ? 'Turno rebotado a otro equipo' : isBuzzerOpen ? '¡Toca rápido!' : 'Esperando pregunta en el tablero...'}
-                    </span>
-                  </button>
-                </div>
-              `}
-            </div>
-
-            <div class="text-center">
-              <a href="?" class="text-xs text-blue-400 hover:text-white underline">
-                Volver a Modo Anfitrión
-              </a>
-            </div>
-          </div>
-        `;
-
-        document.getElementById('btn-player-change-team')?.addEventListener('click', () => {
-          localStorage.removeItem('jeopardy_player_name');
-          render();
-        });
-
-        const btnBuzz = document.getElementById('btn-player-buzz');
-        if (btnBuzz && isBuzzerOpen && !isLocked) {
-          btnBuzz.addEventListener('click', () => {
-            sound.playBuzz();
-            dispatchAction('PLAYER_BUZZ', {
-              teamId: myTeam.id,
-              memberName: myName
-            });
+          document.getElementById('btn-player-change-team')?.addEventListener('click', () => {
+            const oldName = localStorage.getItem('jeopardy_player_name');
+            const oldTeam = localStorage.getItem('jeopardy_player_team');
+            localStorage.removeItem('jeopardy_player_name');
+            localStorage.removeItem('jeopardy_player_team');
+            localStorage.removeItem('jeopardy_player_id');
+            localStorage.removeItem('jeopardy_player_registered');
+            if (oldName && oldTeam) {
+              const team = state.teams.find(t => t.id === oldTeam);
+              const member = team?.members.find(m => m.name === oldName);
+              if (member) {
+                dispatchAction('PLAYER_REMOVE', { teamId: oldTeam, memberId: member.id });
+              }
+            }
+            playerLocalAnswer = '';
+            render();
           });
         }
 
-        const answerForm = document.getElementById('player-answer-form');
-        if (answerForm) {
-          answerForm.addEventListener('submit', (e) => {
-            e.preventDefault();
+        // Actualizar badges superiores en caso de cambio de equipo
+        const badgeColor = document.getElementById('player-badge-color');
+        if (badgeColor) badgeColor.style.backgroundColor = myTeam.color;
+        const badgeName = document.getElementById('player-badge-team-name');
+        if (badgeName) badgeName.textContent = myTeam.name;
+        const bannerName = document.getElementById('player-banner-team-name');
+        if (bannerName) {
+          bannerName.textContent = myTeam.name;
+          bannerName.style.color = myTeam.color;
+        }
+
+        const stage = document.getElementById('player-center-stage');
+        if (!stage) return;
+
+        // 2. Renderizado / Actualización granular del Área Central
+        if (isMyTeamBuzzed) {
+          // --- SUB-CASO 2.1: RESPUESTA YA TRANSMITIDA ---
+          if (b.playerAnswer) {
+            const existingNotice = document.getElementById('player-submitted-notice');
+            if (!existingNotice) {
+              stage.innerHTML = `
+                <div id="player-submitted-notice" class="bg-white border-4 border-emerald-400 rounded-3xl p-5 shadow-xl space-y-3 text-blue-950 animate-in zoom-in-95">
+                  <div class="w-12 h-12 mx-auto rounded-full bg-emerald-100 border-2 border-emerald-500 flex items-center justify-center text-emerald-600 text-2xl font-black">
+                    ✓
+                  </div>
+                  <h3 class="text-xl font-black uppercase font-cinzel text-emerald-800">
+                    Respuesta Enviada
+                  </h3>
+                  <div class="p-3 rounded-xl bg-emerald-50 border border-emerald-300 text-emerald-900 text-xs font-bold">
+                    Transmitida al anfitrión: <strong id="player-submitted-text" class="text-sm block mt-1">"${escapeHtml(b.playerAnswer)}"</strong>
+                  </div>
+                  <p class="text-xs text-blue-900 font-bold animate-pulse">
+                    Esperando veredicto del presentador en la pantalla principal...
+                  </p>
+                </div>
+              `;
+            } else {
+              const textEl = document.getElementById('player-submitted-text');
+              if (textEl) textEl.textContent = `"${b.playerAnswer}"`;
+            }
+            return;
+          }
+
+          // --- SUB-CASO 2.2: TIENES EL TURNO (ESCRIBIENDO RESPUESTA) ---
+          const formExists = document.getElementById('player-answer-form');
+          if (formExists) {
+            // EL FORMULARIO YA ESTÁ EN EL DOM:
+            // REGLA FUNDAMENTAL: NO TOCAR EL FORMULARIO NI EL INPUT PARA EVITAR BLUR / CIERRE DE TECLADO.
+            // Solo actualizar quirúrgicamente el temporizador y la barra de progreso.
+            const timerBadge = document.getElementById('player-timer-badge');
+            if (timerBadge) {
+              timerBadge.textContent = `${b.answerTimeRemaining ?? 10}s`;
+            }
+            const timerBar = document.getElementById('player-timer-bar');
+            if (timerBar) {
+              timerBar.style.width = `${((b.answerTimeRemaining ?? 10) / 10) * 100}%`;
+            }
+          } else {
+            // El formulario NO existe aún (primer montaje tras ganar el turno):
+            // Creamos el formulario e input con tipografía >=16px, sin user-select:none, y scroll amigable
+            stage.innerHTML = `
+              <div id="player-active-turn-card" class="bg-white border-4 border-[#FFCC00] rounded-3xl p-5 shadow-[0_0_40px_rgba(255,204,0,0.6)] space-y-3 text-blue-950 animate-in zoom-in-95 text-left" style="user-select: text; -webkit-user-select: text;">
+                <div class="text-center">
+                  <span class="text-2xl font-black uppercase font-cinzel block text-amber-600 animate-bounce">
+                    ¡TIENES EL TURNO!
+                  </span>
+                </div>
+
+                <div class="p-2.5 rounded-xl bg-amber-50 border-2 border-amber-300">
+                  <div class="flex items-center justify-between text-xs font-black text-amber-900 mb-1">
+                    <span>Tiempo para escribir:</span>
+                    <span id="player-timer-badge" class="font-mono text-sm font-black px-2 py-0.5 rounded bg-amber-500 text-white">
+                      ${b.answerTimeRemaining ?? 10}s
+                    </span>
+                  </div>
+                  <div class="w-full bg-amber-200 h-2 rounded-full overflow-hidden">
+                    <div
+                      id="player-timer-bar"
+                      class="h-full bg-amber-600 transition-all duration-1000 ease-linear rounded-full"
+                      style="width: ${((b.answerTimeRemaining ?? 10) / 10) * 100}%;"
+                    ></div>
+                  </div>
+                </div>
+
+                <form id="player-answer-form" class="space-y-3" style="user-select: text; -webkit-user-select: text;">
+                  <div>
+                    <label for="player-answer-input" class="block text-xs font-black text-blue-950 uppercase mb-1">
+                      Escribe tu Respuesta:
+                    </label>
+                    <input
+                      id="player-answer-input"
+                      type="text"
+                      placeholder="Escribe tu respuesta aquí..."
+                      required
+                      autocomplete="off"
+                      autocorrect="off"
+                      autocapitalize="sentences"
+                      spellcheck="false"
+                      value="${escapeHtml(playerLocalAnswer)}"
+                      class="w-full py-3.5 px-3.5 rounded-xl border-2 border-blue-950 font-bold text-base text-blue-950 outline-none focus:border-amber-500 bg-slate-50 transition-colors shadow-inner"
+                      style="font-size: 16px !important; min-height: 48px; user-select: text; -webkit-user-select: text; -webkit-touch-callout: default; touch-action: manipulation;"
+                    />
+                  </div>
+                  <button
+                    id="btn-submit-answer"
+                    type="submit"
+                    class="w-full py-3.5 rounded-xl bg-[#FFCC00] hover:bg-yellow-300 active:scale-98 text-[#000533] font-black text-xs uppercase tracking-wider shadow-lg cursor-pointer border-2 border-blue-950 transition-all flex items-center justify-center gap-1.5"
+                    style="min-height: 48px; touch-action: manipulation;"
+                  >
+                    <span>Enviar Respuesta</span>
+                    <span>➜</span>
+                  </button>
+                </form>
+              </div>
+            `;
+
             const input = document.getElementById('player-answer-input');
-            if (!input || !input.value.trim()) return;
-            sound.playSelect();
-            dispatchAction('PLAYER_ANSWER', {
-              teamId: myTeam.id,
-              answer: input.value.trim()
-            });
-          });
+            const answerForm = document.getElementById('player-answer-form');
+
+            if (input) {
+              // Manejo con estado local controlado estándar (sin escrituras a Firebase por tecla)
+              input.addEventListener('input', (e) => {
+                playerLocalAnswer = e.target.value;
+              });
+
+              // Desplazamiento visible suave si el teclado móvil reduce el área
+              input.addEventListener('focus', () => {
+                setTimeout(() => {
+                  input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }, 150);
+              });
+
+              // Auto-focus no intrusivo
+              setTimeout(() => {
+                try { input.focus(); } catch (err) {}
+              }, 50);
+            }
+
+            if (answerForm) {
+              answerForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const finalAnswer = (playerLocalAnswer || input?.value || '').trim();
+                if (!finalAnswer) return;
+                sound.playSelect();
+                dispatchAction('PLAYER_ANSWER', {
+                  teamId: myTeam.id,
+                  answer: finalAnswer
+                });
+                playerLocalAnswer = '';
+              });
+            }
+          }
+        } else {
+          // --- SUB-CASO 2.3: MODO PULSADOR NORMAL ---
+          playerLocalAnswer = '';
+          const existingBtn = document.getElementById('btn-player-buzz');
+          if (!existingBtn) {
+            stage.innerHTML = `
+              <div>
+                <button
+                  id="btn-player-buzz"
+                  type="button"
+                  ${!isBuzzerOpen || isLocked ? 'disabled' : ''}
+                  class="w-64 h-64 mx-auto rounded-full border-8 font-cinzel font-black uppercase tracking-widest shadow-2xl transition-all flex flex-col items-center justify-center cursor-pointer select-none active:scale-95 ${
+                    isLocked
+                      ? 'bg-slate-900 border-slate-700 text-slate-500 cursor-not-allowed'
+                      : isBuzzerOpen
+                      ? 'bg-rose-600 hover:bg-rose-500 border-yellow-400 text-white shadow-[0_0_60px_rgba(225,29,72,0.9)] animate-pulse cursor-pointer'
+                      : 'bg-[#000b45] border-blue-600 text-blue-300 cursor-not-allowed opacity-90'
+                  }"
+                  style="touch-action: manipulation;"
+                >
+                  <span id="player-buzz-icon" class="text-3xl mb-1">${isLocked ? '🔒' : isBuzzerOpen ? '⚡' : '🔔'}</span>
+                  <span id="player-buzz-text" class="text-2xl">${isLocked ? 'BLOQUEADO' : isBuzzerOpen ? '¡PULSAR AHORA!' : 'PULSADOR LISTO'}</span>
+                  <span id="player-buzz-subtext" class="text-[11px] font-sans font-bold tracking-normal text-blue-200 mt-2 px-4 leading-tight opacity-90">
+                    ${isLocked 
+                      ? 'Turno rebotado a otro equipo' 
+                      : isBuzzerOpen 
+                      ? '¡Toca la pantalla para responder!' 
+                      : 'Esperando pregunta en el tablero...'}
+                  </span>
+                </button>
+              </div>
+            `;
+
+            const newBtnBuzz = document.getElementById('btn-player-buzz');
+            if (newBtnBuzz) {
+              newBtnBuzz.addEventListener('click', () => {
+                if (!state.buzzerState.isOpen || (state.buzzerState.lockedTeams || []).includes(myTeam.id)) return;
+                sound.playBuzz();
+                dispatchAction('PLAYER_BUZZ', {
+                  teamId: myTeam.id,
+                  memberName: myName
+                });
+              });
+            }
+          } else {
+            // El botón ya existe: solo actualizar estado/clases/textos sin reconstruir el DOM
+            existingBtn.disabled = !isBuzzerOpen || isLocked;
+            existingBtn.className = `w-64 h-64 mx-auto rounded-full border-8 font-cinzel font-black uppercase tracking-widest shadow-2xl transition-all flex flex-col items-center justify-center cursor-pointer select-none active:scale-95 ${
+              isLocked
+                ? 'bg-slate-900 border-slate-700 text-slate-500 cursor-not-allowed'
+                : isBuzzerOpen
+                ? 'bg-rose-600 hover:bg-rose-500 border-yellow-400 text-white shadow-[0_0_60px_rgba(225,29,72,0.9)] animate-pulse cursor-pointer'
+                : 'bg-[#000b45] border-blue-600 text-blue-300 cursor-not-allowed opacity-90'
+            }`;
+            const iconEl = document.getElementById('player-buzz-icon');
+            if (iconEl) iconEl.textContent = isLocked ? '🔒' : isBuzzerOpen ? '⚡' : '🔔';
+            const textEl = document.getElementById('player-buzz-text');
+            if (textEl) textEl.textContent = isLocked ? 'BLOQUEADO' : isBuzzerOpen ? '¡PULSAR AHORA!' : 'PULSADOR LISTO';
+            const subtextEl = document.getElementById('player-buzz-subtext');
+            if (subtextEl) {
+              subtextEl.textContent = isLocked 
+                ? 'Turno rebotado a otro equipo' 
+                : isBuzzerOpen 
+                ? '¡Toca la pantalla para responder!' 
+                : 'Esperando pregunta en el tablero...';
+            }
+          }
         }
       }
 
@@ -1852,9 +3331,40 @@
         `;
       }
 
-      // Iniciar sincronización de red e interfaz
-      initNetworkSync();
-      render();
+      // Iniciar sincronización de red e interfaz de manera robusta
+      try {
+        initNetworkSync();
+      } catch (err) {
+        console.warn('Advertencia al iniciar sincronización de red:', err);
+      }
+
+      try {
+        render();
+      } catch (err) {
+        console.error('Error crítico en el renderizado inicial:', err);
+        var app = document.getElementById('app');
+        if (app) {
+          app.innerHTML = `
+            <div class="min-h-screen bg-[#000533] p-4 flex items-center justify-center">
+              <div class="w-full max-w-md bg-[#000842] border-2 border-amber-400 p-6 rounded-2xl text-center space-y-4 shadow-2xl">
+                <div class="w-12 h-12 mx-auto rounded-xl bg-amber-500/20 border border-amber-400 flex items-center justify-center text-amber-400 text-2xl font-black">
+                  !
+                </div>
+                <h2 class="text-xl font-black text-amber-400 uppercase font-cinzel">Error al Cargar la Aplicación</h2>
+                <p class="text-xs text-slate-300 leading-relaxed">${err && err.message ? err.message : String(err)}</p>
+                <div class="pt-2 flex gap-2 justify-center">
+                  <button onclick="localStorage.clear();sessionStorage.clear();location.reload();" class="px-4 py-2.5 bg-[#FFCC00] text-[#000533] font-black text-xs uppercase rounded-xl cursor-pointer">
+                    Restablecer y Recargar
+                  </button>
+                  <button onclick="location.reload();" class="px-4 py-2.5 bg-slate-800 text-slate-200 font-bold text-xs uppercase rounded-xl border border-slate-600 cursor-pointer">
+                    Reintentar
+                  </button>
+                </div>
+              </div>
+            </div>
+          `;
+        }
+      }
     })();
   </script>
 </body>
