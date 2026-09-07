@@ -431,13 +431,14 @@
 
         // 1. Escuchar la ruta /sessions/{sessionId}/teams para reflejar participantes en tiempo real
         const teamsRef = fbDb.ref(`sessions/${sessionId}/teams`);
+        teamsRef.off();
         teamsRef.on('value', (snapshot) => {
           const teamsVal = snapshot.val();
           if (!teamsVal) return;
 
           let hasChanges = false;
-          Object.keys(teamsVal).forEach(teamColorKey => {
-            const teamNode = teamsVal[teamColorKey];
+          Object.keys(teamsVal).forEach(teamKey => {
+            const teamNode = teamsVal[teamKey];
             const playersNode = teamNode?.players || {};
             const membersList = Object.keys(playersNode).map(k => {
               const p = playersNode[k];
@@ -449,9 +450,10 @@
             });
 
             const matched = state.teams.find(t =>
-              getTeamColorKey(t).toLowerCase() === teamColorKey.toLowerCase() ||
-              t.id.toLowerCase() === teamColorKey.toLowerCase() ||
-              t.name.toLowerCase().includes(teamColorKey.toLowerCase())
+              t.id === teamKey ||
+              t.id.toLowerCase() === teamKey.toLowerCase() ||
+              getTeamColorKey(t).toLowerCase() === teamKey.toLowerCase() ||
+              (t.name && t.name.toLowerCase() === teamKey.toLowerCase())
             );
 
             if (matched) {
@@ -469,8 +471,20 @@
           }
         });
 
-        // 2. Escuchar el estado de la sesión /sessions/{sessionId}/status
+        // 2. Escuchar la cola ordenada de buzzers /sessions/{sessionId}/buzzers en tiempo real
+        const buzzersRef = fbDb.ref(`sessions/${sessionId}/buzzers`);
+        buzzersRef.off();
+        buzzersRef.on('child_added', (snapshot) => {
+          const bVal = snapshot.val();
+          if (!bVal || !bVal.teamId) return;
+          if (currentRole === 'host') {
+            handlePlayerBuzz(bVal.teamId, bVal.memberName, bVal.timestamp);
+          }
+        });
+
+        // 3. Escuchar el estado de la sesión /sessions/{sessionId}/status
         const statusRef = fbDb.ref(`sessions/${sessionId}/status`);
+        statusRef.off();
         statusRef.on('value', (snapshot) => {
           const sVal = snapshot.val();
           if (sVal === 'closed' && currentRole === 'player') {
@@ -482,8 +496,9 @@
           }
         });
 
-        // 3. Escuchar reseteos del tablero /sessions/{sessionId}/board
+        // 4. Escuchar reseteos del tablero /sessions/${sessionId}/board
         const boardRef = fbDb.ref(`sessions/${sessionId}/board`);
+        boardRef.off();
         boardRef.on('value', (snapshot) => {
           const bVal = snapshot.val();
           if (bVal && bVal.resetTimestamp) {
@@ -500,19 +515,18 @@
               buzzedTeamId: null,
               buzzedPlayerName: null,
               buzzedAt: null,
+              questionTimeRemaining: 10,
               answerTimeLimit: 10,
               answerTimeRemaining: 10,
               playerAnswer: null,
               lockedTeams: [],
-              firstAttemptTeamId: null,
-              hasReboundedToFirst: false,
-              attemptedMembers: []
+              queue: []
             };
             try {
               localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
               localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
             } catch (e) {}
-            if (currentRole === 'host' && state.status === 'playing') {
+            if (currentRole === 'host') {
               render();
             }
           }
@@ -1211,23 +1225,8 @@
           }
 
           case 'PLAYER_BUZZ': {
-            const { teamId, memberName } = payload;
-            if (!state.buzzerState.isOpen || (state.buzzerState.lockedTeams || []).includes(teamId)) {
-              return;
-            }
-            sound.playBuzz();
-            const updatedBuzzer = {
-              ...state.buzzerState,
-              isOpen: false,
-              buzzedTeamId: teamId,
-              buzzedPlayerName: memberName,
-              buzzedAt: Date.now(),
-              answerTimeLimit: 10,
-              answerTimeRemaining: 10,
-              playerAnswer: null
-            };
-            const updatedClue = state.activeClue ? { ...state.activeClue, state: 'buzzed' } : null;
-            persistState({ ...state, activeClue: updatedClue, buzzerState: updatedBuzzer });
+            const { teamId, memberName, timestamp } = payload;
+            handlePlayerBuzz(teamId, memberName, timestamp || Date.now());
             break;
           }
 
@@ -1258,10 +1257,131 @@
         }
       }
 
-      // Temporizador autoritativo de 10 segundos
+      // MANEJO AUTORITATIVO DE LA COLA DE BUZZER Y ASIGNACIÓN DE TURNOS
+      function handlePlayerBuzz(teamId, memberName, timestamp = Date.now()) {
+        const clue = state.activeClue;
+        if (!clue || clue.state === 'revealed') return;
+
+        const b = state.buzzerState || {};
+        const locked = b.lockedTeams || [];
+
+        // 1. Si el equipo ya falló y está bloqueado para esta pregunta, ignorar
+        if (locked.includes(teamId)) return;
+
+        // 2. Si este equipo ya tiene el turno activo, ignorar pulsaciones repetidas
+        if (b.buzzedTeamId === teamId) return;
+
+        let currentQueue = Array.isArray(b.queue) ? [...b.queue] : [];
+
+        // 3. Si este equipo ya está registrado en la cola de espera, no duplicar
+        if (currentQueue.some(item => item.teamId === teamId)) return;
+
+        const newEntry = {
+          teamId,
+          memberName: String(memberName || 'Participante').trim(),
+          timestamp: Number(timestamp) || Date.now()
+        };
+
+        // CASO A: NADIE tiene el turno actualmente y la pregunta está abierta
+        if (!b.buzzedTeamId && clue.state === 'buzzing_open') {
+          if (questionTimerInterval) {
+            clearInterval(questionTimerInterval);
+            questionTimerInterval = null;
+          }
+          sound.playBuzz();
+
+          const updatedBuzzer = {
+            ...b,
+            isOpen: false,
+            buzzedTeamId: teamId,
+            buzzedPlayerName: newEntry.memberName,
+            buzzedAt: newEntry.timestamp,
+            questionTimeRemaining: 10,
+            answerTimeLimit: 10,
+            answerTimeRemaining: 10,
+            playerAnswer: null,
+            queue: currentQueue
+          };
+
+          persistState({
+            ...state,
+            activeClue: { ...clue, state: 'buzzed' },
+            buzzerState: updatedBuzzer
+          });
+        } else {
+          // CASO B: Ya hay un equipo respondiendo -> se encola ordenado por timestamp
+          currentQueue.push(newEntry);
+          currentQueue.sort((a, b) => a.timestamp - b.timestamp);
+
+          const updatedBuzzer = {
+            ...b,
+            queue: currentQueue
+          };
+
+          persistState({
+            ...state,
+            buzzerState: updatedBuzzer
+          });
+        }
+      }
+
+      // TEMPORIZADOR 1: Cuenta regresiva de 10 segundos para pulsar (Si nadie presiona)
+      let questionTimerInterval = null;
+      function setupQuestionTimer() {
+        if (questionTimerInterval) {
+          clearInterval(questionTimerInterval);
+          questionTimerInterval = null;
+        }
+
+        if (currentRole !== 'host') return;
+        if (!state.activeClue || state.activeClue.state !== 'buzzing_open') {
+          return;
+        }
+
+        if (typeof state.buzzerState.questionTimeRemaining !== 'number') {
+          state.buzzerState.questionTimeRemaining = 10;
+        }
+
+        questionTimerInterval = setInterval(() => {
+          if (!state.activeClue || state.activeClue.state !== 'buzzing_open' || state.buzzerState.buzzedTeamId) {
+            clearInterval(questionTimerInterval);
+            questionTimerInterval = null;
+            return;
+          }
+
+          const currentRem = state.buzzerState.questionTimeRemaining ?? 10;
+          if (currentRem <= 1) {
+            clearInterval(questionTimerInterval);
+            questionTimerInterval = null;
+            sound.playTimeUp();
+            // Si nadie pulsó en 10 segundos -> revelar automáticamente la respuesta correcta
+            const nextState = closeAndRevealClue(state);
+            persistState(nextState);
+          } else {
+            const nextRem = currentRem - 1;
+            state.buzzerState.questionTimeRemaining = nextRem;
+
+            // Actualización granular visual sin redibujar el modal completo
+            const timerBadge = document.getElementById('question-timer-badge');
+            if (timerBadge) timerBadge.textContent = `${nextRem}s`;
+            const timerBar = document.getElementById('question-timer-bar');
+            if (timerBar) timerBar.style.width = `${(nextRem / 10) * 100}%`;
+
+            persistState({
+              ...state,
+              buzzerState: { ...state.buzzerState, questionTimeRemaining: nextRem }
+            }, true);
+          }
+        }, 1000);
+      }
+
+      // TEMPORIZADOR 2: Cuenta regresiva de 10 segundos para responder (Equipo con el turno)
       let timerInterval = null;
       function setupAnswerTimer() {
-        if (timerInterval) clearInterval(timerInterval);
+        if (timerInterval) {
+          clearInterval(timerInterval);
+          timerInterval = null;
+        }
 
         if (currentRole !== 'host') return;
         if (!state.activeClue || state.activeClue.state !== 'buzzed' || !state.buzzerState.buzzedTeamId) {
@@ -1271,9 +1391,11 @@
         timerInterval = setInterval(() => {
           if (!state.activeClue || state.activeClue.state !== 'buzzed' || !state.buzzerState.buzzedTeamId) {
             clearInterval(timerInterval);
+            timerInterval = null;
             return;
           }
 
+          // Si el jugador ya transmitió su respuesta, detener cuenta regresiva
           if (state.buzzerState.playerAnswer) {
             return;
           }
@@ -1281,29 +1403,32 @@
           const currentRem = state.buzzerState.answerTimeRemaining ?? 10;
           if (currentRem <= 1) {
             clearInterval(timerInterval);
+            timerInterval = null;
             sound.playTimeUp();
             sound.playWrong();
             handleTeamFailedAnswer(state.buzzerState.buzzedTeamId, true);
           } else {
-            const nextB = { ...state.buzzerState, answerTimeRemaining: currentRem - 1 };
+            const nextRem = currentRem - 1;
+            const nextB = { ...state.buzzerState, answerTimeRemaining: nextRem };
             persistState({ ...state, buzzerState: nextB });
           }
         }, 1000);
       }
 
-      // LÓGICA ESTRICTA DE TURNOS Y REBOTES
+      // LÓGICA ESTRICTA DE REASIGNACIÓN DE TURNO POR RESPUESTA INCORRECTA
       function handleTeamFailedAnswer(failedTeamId, isTimeout = false) {
         sound.playWrong();
         const b = state.buzzerState;
         const clue = state.activeClue;
+        if (!clue) return;
 
+        // 1. El equipo que falló queda bloqueado para esta pregunta específica
         let nextLocked = [...(b.lockedTeams || [])];
         if (!nextLocked.includes(failedTeamId)) {
           nextLocked.push(failedTeamId);
         }
 
-        const firstTeam = b.firstAttemptTeamId || failedTeamId;
-
+        // 2. Penalizar puntuación si está configurado en settings
         const updatedTeams = state.teams.map(t => {
           if (t.id === failedTeamId && state.settings.penalizeWrong) {
             return { ...t, score: t.score - clue.value };
@@ -1311,48 +1436,57 @@
           return t;
         });
 
-        const allParticipatingTeamIds = updatedTeams.map(t => t.id);
-        const unattemptedTeams = allParticipatingTeamIds.filter(id => !nextLocked.includes(id));
+        // 3. Revisar la cola de buzzers ordenada por timestamp
+        const queue = Array.isArray(b.queue) ? [...b.queue] : [];
+        // Filtrar participantes que pertenezcan a equipos bloqueados o al que acaba de fallar
+        const eligibleFromQueue = queue.filter(item => !nextLocked.includes(item.teamId));
 
         let nextState = { ...state, teams: updatedTeams };
 
-        if (unattemptedTeams.length > 0) {
-          nextState.activeClue = { ...clue, state: 'buzzing_open' };
+        if (eligibleFromQueue.length > 0) {
+          // REGLA 2: Ceder el turno inmediatamente al siguiente participante en la cola
+          const nextCandidate = eligibleFromQueue[0];
+          const remainingQueue = eligibleFromQueue.slice(1);
+
+          sound.playBuzz();
+          nextState.activeClue = { ...clue, state: 'buzzed' };
           nextState.buzzerState = {
             ...b,
-            isOpen: true,
-            buzzedTeamId: null,
-            buzzedPlayerName: null,
-            buzzedAt: null,
+            isOpen: false,
+            buzzedTeamId: nextCandidate.teamId,
+            buzzedPlayerName: nextCandidate.memberName,
+            buzzedAt: nextCandidate.timestamp,
+            questionTimeRemaining: 10,
             answerTimeLimit: 10,
             answerTimeRemaining: 10,
             playerAnswer: null,
             lockedTeams: nextLocked,
-            firstAttemptTeamId: firstTeam
+            queue: remainingQueue
           };
         } else {
-          // Si todos los demás equipos participantes tuvieron su turno y fallaron:
-          if (state.settings.allowReboundToFirstAfterAllFail && allParticipatingTeamIds.length > 1) {
-            if (b.hasReboundedToFirst) {
-              nextState = closeAndRevealClue(nextState);
-            } else {
-              const otherTeams = allParticipatingTeamIds.filter(id => id !== firstTeam);
-              nextState.activeClue = { ...clue, state: 'buzzing_open' };
-              nextState.buzzerState = {
-                ...b,
-                isOpen: true,
-                buzzedTeamId: null,
-                buzzedPlayerName: null,
-                buzzedAt: null,
-                answerTimeLimit: 10,
-                answerTimeRemaining: 10,
-                playerAnswer: null,
-                lockedTeams: otherTeams,
-                firstAttemptTeamId: firstTeam,
-                hasReboundedToFirst: true
-              };
-            }
+          // Si no hay nadie en la cola, verificar si quedan otros equipos que aún no hayan fallado
+          const activeTeamCount = state.teamCount || state.teams.length;
+          const allActiveTeamIds = state.teams.slice(0, activeTeamCount).map(t => t.id);
+          const unattemptedTeams = allActiveTeamIds.filter(id => !nextLocked.includes(id));
+
+          if (unattemptedTeams.length > 0) {
+            // REGLA 3: Reabrir pulsadores e iniciar cuenta regresiva de 10 segundos para pulsar
+            nextState.activeClue = { ...clue, state: 'buzzing_open' };
+            nextState.buzzerState = {
+              ...b,
+              isOpen: true,
+              buzzedTeamId: null,
+              buzzedPlayerName: null,
+              buzzedAt: null,
+              questionTimeRemaining: 10,
+              answerTimeLimit: 10,
+              answerTimeRemaining: 10,
+              playerAnswer: null,
+              lockedTeams: nextLocked,
+              queue: []
+            };
           } else {
+            // Si ya todos los equipos participantes fallaron, revelar la respuesta correcta
             nextState = closeAndRevealClue(nextState);
           }
         }
@@ -1361,6 +1495,9 @@
       }
 
       function closeAndRevealClue(targetState) {
+        if (questionTimerInterval) { clearInterval(questionTimerInterval); questionTimerInterval = null; }
+        if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+
         const clue = targetState.activeClue;
         const nextCats = targetState.categories.map(cat => ({
           ...cat,
@@ -1376,6 +1513,7 @@
             buzzedTeamId: null,
             buzzedPlayerName: null,
             playerAnswer: null,
+            questionTimeRemaining: 0,
             answerTimeRemaining: 0
           }
         };
@@ -1410,7 +1548,8 @@
           buzzerState: {
             ...b,
             isOpen: false,
-            answerTimeRemaining: 0
+            answerTimeRemaining: 0,
+            questionTimeRemaining: 0
           }
         });
       }
@@ -1667,7 +1806,9 @@
         const app = document.getElementById('app');
         if (!app) return;
 
+        setupQuestionTimer();
         setupAnswerTimer();
+        setupFirebaseSessionListeners();
 
         if (currentRole === 'player') {
           renderPlayerView(app);
@@ -2556,6 +2697,10 @@
             if (!clue || clue.isAnswered) return;
 
             sound.playSelect();
+            if (fbDb) {
+              const sessionId = getFirebaseSessionId();
+              fbDb.ref(`sessions/${sessionId}/buzzers`).remove().catch(() => {});
+            }
             // Activación automática e inmediata de la pista y de los pulsadores móviles
             state.activeClue = {
               ...clue,
@@ -2568,12 +2713,12 @@
               buzzedTeamId: null,
               buzzedPlayerName: null,
               buzzedAt: null,
+              questionTimeRemaining: 10,
               answerTimeLimit: 10,
               answerTimeRemaining: 10,
               playerAnswer: null,
               lockedTeams: [],
-              firstAttemptTeamId: null,
-              hasReboundedToFirst: false
+              queue: []
             };
             persistState(state);
           });
@@ -2603,10 +2748,10 @@
         }
       }
 
-      // MODAL DE PISTA ACTIVA CON CUENTA REGRESIVA DE 10 SEGUNDOS
+      // MODAL DE PISTA ACTIVA CON CUENTA REGRESIVA DE 10 SEGUNDOS Y CONTROLES DEL PRESENTADOR
       function renderClueModalHTML() {
         const clue = state.activeClue;
-        const b = state.buzzerState;
+        const b = state.buzzerState || {};
         const buzzedTeam = state.teams.find(t => t.id === b.buzzedTeamId);
 
         return `
@@ -2618,7 +2763,9 @@
                 </span>
                 <button
                   id="btn-close-modal-x"
-                  class="w-8 h-8 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 font-black text-sm flex items-center justify-center cursor-pointer"
+                  type="button"
+                  class="w-8 h-8 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 font-black text-sm flex items-center justify-center cursor-pointer transition-colors"
+                  title="Cerrar"
                 >✕</button>
               </div>
 
@@ -2628,11 +2775,11 @@
                 </h2>
 
                 ${clue.state === 'revealed' ? `
-                  <div class="mt-6 p-4 rounded-2xl bg-emerald-950/80 border-2 border-emerald-400 text-center animate-in zoom-in-95">
+                  <div class="mt-6 p-4 sm:p-5 rounded-2xl bg-emerald-950/90 border-3 border-emerald-400 text-center shadow-[0_0_30px_rgba(16,185,129,0.3)] animate-in zoom-in-95">
                     <span class="text-xs font-black uppercase tracking-wider text-emerald-300 block mb-1">
                       Respuesta Correcta
                     </span>
-                    <span class="text-xl sm:text-2xl font-black text-white font-cinzel">
+                    <span class="text-xl sm:text-3xl font-black text-white font-cinzel">
                       ${clue.answer}
                     </span>
                   </div>
@@ -2641,14 +2788,56 @@
 
               <div class="space-y-4">
                 ${clue.state === 'buzzing_open' ? `
-                  <div class="p-4 rounded-2xl bg-[#060CE9]/40 border-2 border-[#FFCC00] text-center animate-pulse-fast">
-                    <span class="text-sm sm:text-base font-black text-[#FFCC00] uppercase tracking-widest block">
-                      ¡PULSADORES ACTIVOS! ESPERANDO EQUIPO...
-                    </span>
-                    <div class="text-xs text-blue-200 mt-1">
-                      ${b.lockedTeams && b.lockedTeams.length > 0
-                        ? `Equipos bloqueados temporalmente por fallo: <strong class="text-rose-400">${b.lockedTeams.map(id => state.teams.find(t=>t.id===id)?.name).join(', ')}</strong>`
-                        : 'Pulsadores habilitados automáticamente en todos los teléfonos móviles.'}
+                  <div class="p-4 rounded-2xl bg-[#060CE9]/40 border-2 border-[#FFCC00] text-center space-y-3 shadow-lg">
+                    <div class="flex items-center justify-between text-xs font-black uppercase text-amber-300">
+                      <span class="flex items-center gap-1.5">
+                        <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping"></span>
+                        Tiempo para pulsar el botón:
+                      </span>
+                      <span id="question-timer-badge" class="font-mono text-base font-black px-3 py-1 rounded-xl bg-amber-500 text-black shadow">
+                        ${b.questionTimeRemaining ?? 10}s
+                      </span>
+                    </div>
+
+                    <div class="w-full bg-blue-950 h-3 rounded-full overflow-hidden border border-blue-800">
+                      <div
+                        id="question-timer-bar"
+                        class="h-full bg-gradient-to-r from-amber-500 to-yellow-300 transition-all duration-1000 ease-linear rounded-full"
+                        style="width: ${((b.questionTimeRemaining ?? 10) / 10) * 100}%;"
+                      ></div>
+                    </div>
+
+                    <p class="text-[11px] text-blue-200">
+                      Si nadie presiona el buzzer en 10 segundos, se revelará automáticamente la respuesta correcta.
+                    </p>
+
+                    ${b.queue && b.queue.length > 0 ? `
+                      <div class="p-2.5 rounded-xl bg-blue-900/60 border border-blue-500 text-xs text-blue-200 flex flex-wrap gap-2 items-center justify-center">
+                        <span class="font-black text-amber-300">Cola de espera:</span>
+                        ${b.queue.map((q, idx) => `
+                          <span class="px-2 py-0.5 rounded bg-blue-950 text-white border border-blue-400 font-mono text-[11px]">
+                            ${idx + 1}º ${state.teams.find(t=>t.id===q.teamId)?.name || q.teamId} (${q.memberName})
+                          </span>
+                        `).join('')}
+                      </div>
+                    ` : ''}
+
+                    ${b.lockedTeams && b.lockedTeams.length > 0 ? `
+                      <div class="text-xs text-rose-300 bg-rose-950/40 p-2 rounded-xl border border-rose-800">
+                        Equipos bloqueados para esta pregunta por respuesta errónea: <strong class="text-rose-400">${b.lockedTeams.map(id => state.teams.find(t=>t.id===id)?.name).join(', ')}</strong>
+                      </div>
+                    ` : ''}
+
+                    <!-- Botón del presentador para cerrar y revelar inmediatamente -->
+                    <div class="pt-2 flex justify-end">
+                      <button
+                        id="btn-close-reveal-answer"
+                        type="button"
+                        class="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs sm:text-sm uppercase tracking-wider border-2 border-amber-300 cursor-pointer shadow-lg transition-all flex items-center justify-center gap-2"
+                      >
+                        <span>👁️</span>
+                        <span>Cerrar / Revelar Respuesta</span>
+                      </button>
                     </div>
                   </div>
                 ` : ''}
@@ -2663,7 +2852,7 @@
                         Turno Otorgado:
                       </span>
                       <span
-                        class="px-3 py-1 rounded-xl text-xs sm:text-sm font-black text-white uppercase tracking-wider"
+                        class="px-3 py-1 rounded-xl text-xs sm:text-sm font-black text-white uppercase tracking-wider shadow"
                         style="background-color: ${buzzedTeam.color};"
                       >
                         ${buzzedTeam.name}
@@ -2675,41 +2864,68 @@
                     </div>
 
                     ${b.playerAnswer ? `
-                      <div class="p-2.5 rounded-xl bg-emerald-500/20 border border-emerald-400 text-emerald-300 text-xs font-bold">
-                        Respuesta enviada: <span class="text-white text-sm font-black">"${b.playerAnswer}"</span>
+                      <div class="p-3 rounded-xl bg-emerald-500/20 border-2 border-emerald-400 text-emerald-200 text-xs font-bold space-y-1">
+                        <span class="text-[10px] uppercase tracking-wider text-emerald-400 block font-black">Respuesta escrita recibida:</span>
+                        <span class="text-white text-base sm:text-lg font-black block">"${b.playerAnswer}"</span>
                       </div>
                     ` : `
                       <div class="p-3 rounded-xl bg-amber-500/20 border-2 border-amber-400 text-center space-y-2">
                         <div class="flex items-center justify-between text-xs font-black uppercase text-amber-300">
                           <span>Tiempo límite para responder:</span>
-                          <span class="font-mono text-base font-black px-2.5 py-0.5 rounded bg-amber-500 text-black">
+                          <span id="player-timer-badge" class="font-mono text-base font-black px-2.5 py-0.5 rounded bg-amber-500 text-black">
                             ${b.answerTimeRemaining ?? 10}s
                           </span>
                         </div>
                         <div class="w-full bg-amber-950 h-2.5 rounded-full overflow-hidden">
                           <div
+                            id="player-timer-bar"
                             class="h-full bg-amber-400 transition-all duration-1000 ease-linear rounded-full"
                             style="width: ${((b.answerTimeRemaining ?? 10) / 10) * 100}%;"
                           ></div>
                         </div>
                         <p class="text-[11px] text-amber-200">
-                          Si no responde en 10 segundos, el turno rebotará automáticamente al siguiente equipo.
+                          Si no responde a tiempo, el turno rebotará inmediatamente al siguiente participante en la cola.
                         </p>
                       </div>
                     `}
 
+                    ${b.queue && b.queue.length > 0 ? `
+                      <div class="p-2 rounded-xl bg-blue-950/80 border border-blue-600 text-xs text-blue-200 flex flex-wrap items-center justify-center gap-1.5">
+                        <span class="font-bold text-[#FFCC00]">En cola si este equipo falla:</span>
+                        ${b.queue.map((q, idx) => `
+                          <span class="px-2 py-0.5 rounded bg-blue-900 text-white font-mono text-[10px]">
+                            ${idx + 1}º ${state.teams.find(t=>t.id===q.teamId)?.name || q.teamId}
+                          </span>
+                        `).join('')}
+                      </div>
+                    ` : ''}
+
                     <div class="grid grid-cols-2 gap-3 pt-2">
                       <button
                         id="btn-judge-correct"
-                        class="py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs sm:text-sm uppercase tracking-wider shadow border border-emerald-300 cursor-pointer"
+                        type="button"
+                        class="py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs sm:text-sm uppercase tracking-wider shadow border border-emerald-300 cursor-pointer transition-all"
                       >
                         Respuesta Correcta (+${clue.value})
                       </button>
                       <button
                         id="btn-judge-wrong"
-                        class="py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-black text-xs sm:text-sm uppercase tracking-wider shadow border border-rose-300 cursor-pointer"
+                        type="button"
+                        class="py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-black text-xs sm:text-sm uppercase tracking-wider shadow border border-rose-300 cursor-pointer transition-all"
                       >
-                        Incorrecto / Rebote (-${clue.value})
+                        Incorrecto / Siguiente en Cola (-${clue.value})
+                      </button>
+                    </div>
+
+                    <!-- Botón del presentador para cerrar y revelar inmediatamente -->
+                    <div class="pt-2 flex justify-end">
+                      <button
+                        id="btn-close-reveal-answer"
+                        type="button"
+                        class="w-full sm:w-auto px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs uppercase tracking-wider border border-amber-300 cursor-pointer shadow transition-all flex items-center justify-center gap-1.5"
+                      >
+                        <span>👁️</span>
+                        <span>Cerrar / Revelar Respuesta</span>
                       </button>
                     </div>
                   </div>
@@ -2717,10 +2933,12 @@
 
                 ${clue.state === 'revealed' ? `
                   <button
-                    id="btn-modal-finish"
-                    class="w-full py-3.5 rounded-xl bg-[#FFCC00] hover:bg-yellow-300 text-[#000533] font-black text-sm uppercase tracking-widest shadow cursor-pointer"
+                    id="btn-close-back-to-board"
+                    type="button"
+                    class="w-full py-4 rounded-2xl bg-gradient-to-r from-[#D4AF37] via-[#FFCC00] to-[#D4AF37] hover:brightness-110 active:scale-98 text-[#000533] font-black text-sm sm:text-base uppercase tracking-widest shadow-[0_0_30px_rgba(255,204,0,0.5)] border-2 border-white cursor-pointer flex items-center justify-center gap-2 transition-all"
                   >
-                    Cerrar Pista y Regresar al Tablero
+                    <span>✕</span>
+                    <span>Cerrar / Volver al Tablero</span>
                   </button>
                 ` : ''}
               </div>
@@ -2744,9 +2962,32 @@
           });
         }
 
-        const btnFinish = document.getElementById('btn-modal-finish');
+        // Botón "Cerrar / Revelar Respuesta" (presentador durante espera de respuesta o pulsadores)
+        const btnCloseReveal = document.getElementById('btn-close-reveal-answer');
+        if (btnCloseReveal) {
+          btnCloseReveal.addEventListener('click', () => {
+            sound.playSelect();
+            if (questionTimerInterval) { clearInterval(questionTimerInterval); questionTimerInterval = null; }
+            if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+            const nextState = closeAndRevealClue(state);
+            persistState(nextState);
+          });
+        }
+
+        // Botón "Cerrar / Volver al Tablero" (en la vista de Respuesta Correcta)
+        const btnCloseBack = document.getElementById('btn-close-back-to-board');
         const btnCloseX = document.getElementById('btn-close-modal-x');
-        const closeModal = () => {
+
+        const returnToBoard = () => {
+          sound.playSelect();
+          if (questionTimerInterval) { clearInterval(questionTimerInterval); questionTimerInterval = null; }
+          if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+
+          if (fbDb) {
+            const sessionId = getFirebaseSessionId();
+            fbDb.ref(`sessions/${sessionId}/buzzers`).remove().catch(() => {});
+          }
+
           const clue = state.activeClue;
           const nextCats = state.categories.map(cat => ({
             ...cat,
@@ -2759,18 +3000,31 @@
             buzzedTeamId: null,
             buzzedPlayerName: null,
             buzzedAt: null,
+            questionTimeRemaining: 10,
             answerTimeLimit: 10,
             answerTimeRemaining: 10,
             playerAnswer: null,
             lockedTeams: [],
-            firstAttemptTeamId: null,
-            hasReboundedToFirst: false
+            queue: []
           };
           persistState(state);
         };
 
-        if (btnFinish) btnFinish.addEventListener('click', closeModal);
-        if (btnCloseX) btnCloseX.addEventListener('click', closeModal);
+        if (btnCloseBack) btnCloseBack.addEventListener('click', returnToBoard);
+        if (btnCloseX) {
+          btnCloseX.addEventListener('click', () => {
+            if (state.activeClue && state.activeClue.state === 'revealed') {
+              returnToBoard();
+            } else {
+              // Si aún no está revelada, dar la opción directa de cerrarla y revelarla
+              sound.playSelect();
+              if (questionTimerInterval) { clearInterval(questionTimerInterval); questionTimerInterval = null; }
+              if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+              const nextState = closeAndRevealClue(state);
+              persistState(nextState);
+            }
+          });
+        }
       }
 
       // Estado local persistente para el input de respuesta móvil (evita pérdida de foco y cierres de teclado)
@@ -2981,15 +3235,25 @@
             }
 
             // 7. Sincronización en Firebase Realtime Database
-            // Ruta requerida: /sessions/{sessionId}/teams/{teamColor}/players
+            // Ruta estricta requerida: /sessions/{sessionId}/teams/{teamId}/players/{playerId}
             if (fbDb) {
               const sessionId = getFirebaseSessionId();
-              const teamColorKey = getTeamColorKey(targetTeam);
-              fbDb.ref(`sessions/${sessionId}/teams/${teamColorKey}/players/${memberId}`).set({
-                id: memberId,
+              const teamId = targetTeam ? targetTeam.id : chosenTeam;
+              const teamColorKey = targetTeam ? getTeamColorKey(targetTeam) : null;
+              const playerPayload = {
                 name: chosenName,
                 joinedAt: Date.now()
-              }).catch(err => console.warn('Firebase push player error:', err));
+              };
+
+              // Guardar bajo /teams/{teamId}/players/{playerId}
+              fbDb.ref(`sessions/${sessionId}/teams/${teamId}/players/${memberId}`).set(playerPayload)
+                .catch(err => console.warn('Firebase push player error:', err));
+
+              // Compatibilidad adicional con clave de color si difiere del ID
+              if (teamColorKey && teamColorKey !== teamId) {
+                fbDb.ref(`sessions/${sessionId}/teams/${teamColorKey}/players/${memberId}`).set(playerPayload)
+                  .catch(() => {});
+              }
             }
 
             // 8. Notificar por WebSocket y WebRTC P2P
@@ -3236,6 +3500,32 @@
         } else {
           // --- SUB-CASO 2.3: MODO PULSADOR NORMAL ---
           playerLocalAnswer = '';
+          const isInQueue = (b.queue || []).some(q => q.teamId === myTeam.id);
+          const queuePosition = isInQueue ? ((b.queue || []).findIndex(q => q.teamId === myTeam.id) + 1) : 0;
+          const isButtonDisabled = !isBuzzerOpen || isLocked || isInQueue;
+
+          let btnClass = 'bg-[#000b45] border-blue-600 text-blue-300 cursor-not-allowed opacity-90';
+          let iconText = '🔔';
+          let labelText = 'PULSADOR LISTO';
+          let subText = 'Esperando pregunta en el tablero...';
+
+          if (isLocked) {
+            btnClass = 'bg-slate-900 border-slate-700 text-slate-500 cursor-not-allowed';
+            iconText = '🔒';
+            labelText = 'BLOQUEADO';
+            subText = 'Turno fallado para esta pregunta. Esperando siguiente pista...';
+          } else if (isInQueue) {
+            btnClass = 'bg-amber-600 border-yellow-300 text-white shadow-[0_0_40px_rgba(245,158,11,0.8)] animate-pulse cursor-not-allowed';
+            iconText = '⏳';
+            labelText = `EN COLA (${queuePosition}º)`;
+            subText = '¡Tu pulsación está en la cola! Si el equipo actual falla, tu turno se activará inmediatamente.';
+          } else if (isBuzzerOpen) {
+            btnClass = 'bg-rose-600 hover:bg-rose-500 border-yellow-400 text-white shadow-[0_0_60px_rgba(225,29,72,0.9)] animate-pulse cursor-pointer';
+            iconText = '⚡';
+            labelText = '¡PULSAR AHORA!';
+            subText = '¡Toca la pantalla para responder!';
+          }
+
           const existingBtn = document.getElementById('btn-player-buzz');
           if (!existingBtn) {
             stage.innerHTML = `
@@ -3243,24 +3533,14 @@
                 <button
                   id="btn-player-buzz"
                   type="button"
-                  ${!isBuzzerOpen || isLocked ? 'disabled' : ''}
-                  class="w-64 h-64 mx-auto rounded-full border-8 font-cinzel font-black uppercase tracking-widest shadow-2xl transition-all flex flex-col items-center justify-center cursor-pointer select-none active:scale-95 ${
-                    isLocked
-                      ? 'bg-slate-900 border-slate-700 text-slate-500 cursor-not-allowed'
-                      : isBuzzerOpen
-                      ? 'bg-rose-600 hover:bg-rose-500 border-yellow-400 text-white shadow-[0_0_60px_rgba(225,29,72,0.9)] animate-pulse cursor-pointer'
-                      : 'bg-[#000b45] border-blue-600 text-blue-300 cursor-not-allowed opacity-90'
-                  }"
+                  ${isButtonDisabled ? 'disabled' : ''}
+                  class="w-64 h-64 mx-auto rounded-full border-8 font-cinzel font-black uppercase tracking-widest shadow-2xl transition-all flex flex-col items-center justify-center select-none active:scale-95 ${btnClass}"
                   style="touch-action: manipulation;"
                 >
-                  <span id="player-buzz-icon" class="text-3xl mb-1">${isLocked ? '🔒' : isBuzzerOpen ? '⚡' : '🔔'}</span>
-                  <span id="player-buzz-text" class="text-2xl">${isLocked ? 'BLOQUEADO' : isBuzzerOpen ? '¡PULSAR AHORA!' : 'PULSADOR LISTO'}</span>
-                  <span id="player-buzz-subtext" class="text-[11px] font-sans font-bold tracking-normal text-blue-200 mt-2 px-4 leading-tight opacity-90">
-                    ${isLocked 
-                      ? 'Turno rebotado a otro equipo' 
-                      : isBuzzerOpen 
-                      ? '¡Toca la pantalla para responder!' 
-                      : 'Esperando pregunta en el tablero...'}
+                  <span id="player-buzz-icon" class="text-3xl mb-1">${iconText}</span>
+                  <span id="player-buzz-text" class="text-2xl">${labelText}</span>
+                  <span id="player-buzz-subtext" class="text-[11px] font-sans font-bold tracking-normal mt-2 px-4 leading-tight opacity-90">
+                    ${subText}
                   </span>
                 </button>
               </div>
@@ -3269,36 +3549,37 @@
             const newBtnBuzz = document.getElementById('btn-player-buzz');
             if (newBtnBuzz) {
               newBtnBuzz.addEventListener('click', () => {
-                if (!state.buzzerState.isOpen || (state.buzzerState.lockedTeams || []).includes(myTeam.id)) return;
+                if (isLocked || isInQueue || !state.buzzerState.isOpen) return;
+                const now = Date.now();
+
+                // Registrar en cola de Firebase /sessions/{sessionId}/buzzers
+                if (fbDb) {
+                  const sessionId = getFirebaseSessionId();
+                  fbDb.ref(`sessions/${sessionId}/buzzers`).push({
+                    teamId: myTeam.id,
+                    memberName: myName,
+                    timestamp: now
+                  }).catch(err => console.warn('Firebase push buzz error:', err));
+                }
+
                 sound.playBuzz();
                 dispatchAction('PLAYER_BUZZ', {
                   teamId: myTeam.id,
-                  memberName: myName
+                  memberName: myName,
+                  timestamp: now
                 });
               });
             }
           } else {
             // El botón ya existe: solo actualizar estado/clases/textos sin reconstruir el DOM
-            existingBtn.disabled = !isBuzzerOpen || isLocked;
-            existingBtn.className = `w-64 h-64 mx-auto rounded-full border-8 font-cinzel font-black uppercase tracking-widest shadow-2xl transition-all flex flex-col items-center justify-center cursor-pointer select-none active:scale-95 ${
-              isLocked
-                ? 'bg-slate-900 border-slate-700 text-slate-500 cursor-not-allowed'
-                : isBuzzerOpen
-                ? 'bg-rose-600 hover:bg-rose-500 border-yellow-400 text-white shadow-[0_0_60px_rgba(225,29,72,0.9)] animate-pulse cursor-pointer'
-                : 'bg-[#000b45] border-blue-600 text-blue-300 cursor-not-allowed opacity-90'
-            }`;
+            existingBtn.disabled = isButtonDisabled;
+            existingBtn.className = `w-64 h-64 mx-auto rounded-full border-8 font-cinzel font-black uppercase tracking-widest shadow-2xl transition-all flex flex-col items-center justify-center select-none active:scale-95 ${btnClass}`;
             const iconEl = document.getElementById('player-buzz-icon');
-            if (iconEl) iconEl.textContent = isLocked ? '🔒' : isBuzzerOpen ? '⚡' : '🔔';
+            if (iconEl) iconEl.textContent = iconText;
             const textEl = document.getElementById('player-buzz-text');
-            if (textEl) textEl.textContent = isLocked ? 'BLOQUEADO' : isBuzzerOpen ? '¡PULSAR AHORA!' : 'PULSADOR LISTO';
+            if (textEl) textEl.textContent = labelText;
             const subtextEl = document.getElementById('player-buzz-subtext');
-            if (subtextEl) {
-              subtextEl.textContent = isLocked 
-                ? 'Turno rebotado a otro equipo' 
-                : isBuzzerOpen 
-                ? '¡Toca la pantalla para responder!' 
-                : 'Esperando pregunta en el tablero...';
-            }
+            if (subtextEl) subtextEl.textContent = subText;
           }
         }
       }
