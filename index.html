@@ -806,16 +806,19 @@
       let fbDb = null;
       let isFirebaseReady = false;
 
-      function getTeamColorKey(team) {
+      function getNormalizedTeamKey(team) {
         if (!team) return 'azul';
-        if (team.colorKey) return team.colorKey;
-        const name = (team.name || '').toLowerCase();
-        if (name.includes('azul') || name.includes('blue')) return 'azul';
-        if (name.includes('rojo') || name.includes('red')) return 'rojo';
-        if (name.includes('verde') || name.includes('green')) return 'verde';
-        if (name.includes('dora') || name.includes('amar') || name.includes('gold') || name.includes('yellow')) return 'dorado';
-        if (name.includes('mora') || name.includes('purp')) return 'morado';
-        return team.id || 'azul';
+        const str = (typeof team === 'object' ? (team.colorKey || team.id || team.name || '') : String(team)).toLowerCase().trim();
+        if (str === 'team-1' || str.includes('azul') || str.includes('blue')) return 'azul';
+        if (str === 'team-2' || str.includes('rojo') || str.includes('red')) return 'rojo';
+        if (str === 'team-3' || str.includes('verde') || str.includes('green')) return 'verde';
+        if (str === 'team-4' || str.includes('amar') || str.includes('dora') || str.includes('gold') || str.includes('yellow')) return 'amarillo';
+        if (str === 'team-5' || str.includes('mora') || str.includes('purp')) return 'morado';
+        return str.replace(/[^a-z0-9_-]/g, '') || 'azul';
+      }
+
+      function getTeamColorKey(team) {
+        return getNormalizedTeamKey(team);
       }
 
       function getFirebaseSessionId() {
@@ -849,49 +852,93 @@
         }
       }
 
+      // Procesador unificado a prueba de fallos para sincronizar datos de participantes recibidos de Firebase
+      function syncTeamsDataFromFirebase(teamsVal) {
+        if (!teamsVal || typeof teamsVal !== 'object') return;
+        state.gameState = state.gameState || {};
+        state.gameState.teams = state.gameState.teams || {};
+
+        const prevTotal = (state.teams || []).reduce((acc, t) => acc + (t.members?.length || 0), 0);
+
+        (state.teams || []).forEach(team => {
+          const normKey = getNormalizedTeamKey(team.id || team.colorKey || team.name);
+          const teamNode = teamsVal[team.id] || teamsVal[normKey] || (team.colorKey ? teamsVal[team.colorKey] : null) || (team.name ? teamsVal[team.name.toLowerCase()] : null);
+          const playersNode = teamNode?.players || (teamNode && !teamNode.players && typeof teamNode === 'object' && Object.values(teamNode).some(v => v && (v.name || v.id)) ? teamNode : {});
+
+          const playersObj = {};
+          if (playersNode) {
+            if (Array.isArray(playersNode)) {
+              playersNode.forEach((p, idx) => {
+                if (p && p.name) {
+                  const pid = p.id || ('p-' + idx);
+                  playersObj[pid] = { id: pid, name: String(p.name).trim(), timestamp: p.timestamp || p.joinedAt || Date.now() };
+                }
+              });
+            } else if (typeof playersNode === 'object') {
+              Object.keys(playersNode).forEach(k => {
+                const p = playersNode[k];
+                if (p && p.name) {
+                  playersObj[p.id || k] = { id: p.id || k, name: String(p.name).trim(), timestamp: p.timestamp || p.joinedAt || Date.now() };
+                }
+              });
+            }
+          }
+
+          // Exponer en gameState.teams bajo team.id Y normKey (para cumplir const teamData = gameState?.teams?.[team.id])
+          state.gameState.teams[team.id] = { id: team.id, players: playersObj };
+          state.gameState.teams[normKey] = { id: normKey, players: playersObj };
+          if (team.colorKey) state.gameState.teams[team.colorKey] = { id: team.colorKey, players: playersObj };
+
+          // Actualizar team.members unificado
+          const playerList = Object.values(playersObj);
+          const currentMembers = [...(team.members || [])];
+          playerList.forEach(p => {
+            const exists = currentMembers.some(m => m.name.toLowerCase() === p.name.toLowerCase() || m.id === p.id);
+            if (!exists) {
+              currentMembers.push({
+                id: p.id,
+                name: p.name,
+                joinedAt: p.timestamp || Date.now()
+              });
+            }
+          });
+          team.members = currentMembers;
+        });
+
+        const newTotal = (state.teams || []).reduce((acc, t) => acc + (t.members?.length || 0), 0);
+        if (newTotal > prevTotal && currentRole === 'host') {
+          sound.playJoin();
+        }
+
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
+        } catch (e) {}
+
+        updateLiveParticipantsDOM();
+      }
+
       function setupFirebaseSessionListeners() {
         if (!fbDb) return;
         const sessionId = getFirebaseSessionId();
 
-        // 1. Escuchar la ruta /sessions/{sessionId}/teams para reflejar participantes en tiempo real
+        // 1. Escuchar la ruta limpia /jeopardy_game/teams en tiempo real
+        const jeopardyTeamsRef = fbDb.ref('jeopardy_game/teams');
+        jeopardyTeamsRef.off();
+        jeopardyTeamsRef.on('value', (snapshot) => {
+          const teamsVal = snapshot.val();
+          if (teamsVal) {
+            syncTeamsDataFromFirebase(teamsVal);
+          }
+        });
+
+        // 1B. Escuchar la ruta /sessions/{sessionId}/teams para participantes en tiempo real
         const teamsRef = fbDb.ref(`sessions/${sessionId}/teams`);
         teamsRef.off();
         teamsRef.on('value', (snapshot) => {
           const teamsVal = snapshot.val();
-          if (!teamsVal) return;
-
-          let hasChanges = false;
-          Object.keys(teamsVal).forEach(teamKey => {
-            const teamNode = teamsVal[teamKey];
-            const playersNode = teamNode?.players || {};
-            const membersList = Object.keys(playersNode).map(k => {
-              const p = playersNode[k];
-              return {
-                id: p.id || k,
-                name: p.name || 'Participante',
-                joinedAt: p.joinedAt || Date.now()
-              };
-            });
-
-            const matched = state.teams.find(t =>
-              t.id === teamKey ||
-              t.id.toLowerCase() === teamKey.toLowerCase() ||
-              getTeamColorKey(t).toLowerCase() === teamKey.toLowerCase() ||
-              (t.name && t.name.toLowerCase() === teamKey.toLowerCase())
-            );
-
-            if (matched) {
-              matched.members = membersList;
-              hasChanges = true;
-            }
-          });
-
-          if (hasChanges) {
-            try {
-              localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-              localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
-            } catch (e) {}
-            updateLiveParticipantsDOM();
+          if (teamsVal) {
+            syncTeamsDataFromFirebase(teamsVal);
           }
         });
 
@@ -1550,35 +1597,76 @@
         if (currentRole !== 'host') return;
         const teamCount = state.teamCount || state.teams.length;
         const activeTeams = state.teams.slice(0, teamCount);
-        const totalConnected = activeTeams.reduce((acc, t) => acc + (t.members?.length || 0), 0);
+        const gameState = state.gameState || {};
+        let totalConnected = 0;
 
-        // 1. Vista de Códigos QR (renderQRCodesScreen)
         activeTeams.forEach((team) => {
+          // Lectura a prueba de fallos según directiva estricta:
+          const teamData = gameState?.teams?.[team.id] || (team.colorKey ? gameState?.teams?.[team.colorKey] : null) || gameState?.teams?.[getNormalizedTeamKey(team.id)];
+          const playerList = teamData?.players ? Object.values(teamData.players) : [];
+
+          // Mapear de forma limpia y única cada nombre de jugador garantizando claves únicas y filtrando duplicados o entradas vacías
+          const seenNames = new Set();
+          const cleanPlayerList = [];
+
+          // 1. Extraer desde playerList (Firebase)
+          playerList.forEach((p, pIdx) => {
+            const trimmedName = String(p?.name || '').trim();
+            if (!trimmedName) return;
+            const lower = trimmedName.toLowerCase();
+            if (!seenNames.has(lower)) {
+              seenNames.add(lower);
+              cleanPlayerList.push({
+                id: p?.id || ('fb-' + team.id + '-' + pIdx + '-' + lower),
+                name: trimmedName
+              });
+            }
+          });
+
+          // 2. Complementar con state.teams si hubiese miembros locales previos
+          (team.members || []).forEach((m, mIdx) => {
+            const trimmedName = String(m?.name || '').trim();
+            if (!trimmedName) return;
+            const lower = trimmedName.toLowerCase();
+            if (!seenNames.has(lower)) {
+              seenNames.add(lower);
+              cleanPlayerList.push({
+                id: m?.id || ('local-' + team.id + '-' + mIdx + '-' + lower),
+                name: trimmedName
+              });
+            }
+          });
+
+          team.members = cleanPlayerList;
+          const memberCount = cleanPlayerList.length;
+          totalConnected += memberCount;
+
+          // 1. Vista de Códigos QR (renderQRCodesScreen)
           const countEl = document.getElementById(`qr-team-count-${team.id}`);
           if (countEl) {
-            countEl.textContent = `${team.members.length} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} registrados`;
+            countEl.textContent = `${memberCount} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} registrados`;
           }
           const badgeCountEl = document.getElementById(`qr-team-badge-count-${team.id}`);
           if (badgeCountEl) {
-            badgeCountEl.textContent = String(team.members.length);
+            badgeCountEl.textContent = String(memberCount);
           }
           const membersBox = document.getElementById(`qr-team-members-${team.id}`);
           if (membersBox) {
-            if (team.members.length === 0) {
+            if (memberCount === 0) {
               membersBox.innerHTML = `
                 <span class="text-[11px] text-blue-400/60 italic py-1">
                   Esperando participantes...
                 </span>
               `;
             } else {
-              membersBox.innerHTML = team.members.map(m => `
-                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-900/90 text-white border border-blue-500 shadow-sm animate-in zoom-in-95">
+              membersBox.innerHTML = cleanPlayerList.map((player) => `
+                <span key="qr-${team.id}-${player.id}" class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-900/90 text-white border border-blue-500 shadow-sm animate-in zoom-in-95">
                   <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                  <span class="truncate max-w-[80px]">${m.name}</span>
+                  <span class="truncate max-w-[80px]">${player.name}</span>
                   <button
                     type="button"
                     data-team-id="${team.id}"
-                    data-member-id="${m.id}"
+                    data-member-id="${player.id}"
                     class="btn-remove-member hover:text-rose-400 text-xs font-black ml-0.5 cursor-pointer"
                     title="Remover participante"
                   >×</button>
@@ -1599,16 +1687,16 @@
           // 2. Vista de Configuración Inicial (renderSetupScreen)
           const setupCountEl = document.getElementById(`setup-team-count-${team.id}`);
           if (setupCountEl) {
-            setupCountEl.textContent = `${team.members?.length || 0} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam}`;
+            setupCountEl.textContent = `${memberCount} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam}`;
           }
           const setupMembersBox = document.getElementById(`setup-team-members-${team.id}`);
           if (setupMembersBox) {
-            if ((team.members || []).length === 0) {
+            if (memberCount === 0) {
               setupMembersBox.innerHTML = `<span class="text-[10px] text-blue-400/60 italic py-1">Esperando...</span>`;
             } else {
-              setupMembersBox.innerHTML = team.members.map(m => `
-                <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900 text-white border border-blue-500 shadow-sm">
-                  ${m.name}
+              setupMembersBox.innerHTML = cleanPlayerList.map((player) => `
+                <span key="setup-${team.id}-${player.id}" class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900 text-white border border-blue-500 shadow-sm">
+                  ${player.name}
                 </span>
               `).join('');
             }
@@ -2978,12 +3066,31 @@
                   </div>
 
                   <div class="grid gap-3 sm:gap-4 pt-2" style="grid-template-columns: repeat(${teamCount}, minmax(0, 1fr));">
-                    ${state.teams.slice(0, teamCount).map((team) => `
+                    ${state.teams.slice(0, teamCount).map((team) => {
+                      const teamData = state.gameState?.teams?.[team.id] || (team.colorKey ? state.gameState?.teams?.[team.colorKey] : null) || state.gameState?.teams?.[getNormalizedTeamKey(team.id)];
+                      const playerList = teamData?.players ? Object.values(teamData.players) : [];
+                      const seen = new Set();
+                      const playerNames = [];
+                      playerList.forEach(p => {
+                        const n = String(p?.name || '').trim();
+                        if (n && !seen.has(n.toLowerCase())) {
+                          seen.add(n.toLowerCase());
+                          playerNames.push(n);
+                        }
+                      });
+                      (team.members || []).forEach(m => {
+                        const n = String(m?.name || '').trim();
+                        if (n && !seen.has(n.toLowerCase())) {
+                          seen.add(n.toLowerCase());
+                          playerNames.push(n);
+                        }
+                      });
+                      return `
                       <div class="rounded-xl border-2 p-3 bg-[#000428] text-center shadow flex flex-col items-center justify-between" style="border-color: ${team.color};">
                         <div class="w-full pb-1 border-b border-blue-900/60 flex items-center justify-between">
                           <span class="text-white font-black text-xs uppercase truncate">${team.name}</span>
                           <span id="setup-team-count-${team.id}" class="text-[11px] font-mono font-bold" style="color: ${team.color};">
-                            ${team.members?.length || 0} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam}
+                            ${playerNames.length} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam}
                           </span>
                         </div>
                         <div class="my-2 p-1.5 sm:p-2 bg-white rounded-xl shadow inline-block">
@@ -2992,17 +3099,18 @@
                         <div class="w-full bg-[#00021A] rounded-lg p-1.5 text-center min-h-[48px]">
                           <span class="text-[9px] uppercase font-black text-blue-400 block mb-0.5">Registrados:</span>
                           <div id="setup-team-members-${team.id}" class="flex flex-wrap gap-1 justify-center max-h-[48px] overflow-y-auto">
-                            ${(team.members || []).length === 0 ? `
+                            ${playerNames.length === 0 ? `
                               <span class="text-[10px] text-blue-400/60 italic py-1">Esperando...</span>
-                            ` : team.members.map(m => `
-                              <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900 text-white border border-blue-500 shadow-sm">
-                                ${m.name}
+                            ` : playerNames.map((pName, pIdx) => `
+                              <span key="setup-${team.id}-${pIdx}" class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900 text-white border border-blue-500 shadow-sm">
+                                ${pName}
                               </span>
                             `).join('')}
                           </div>
                         </div>
                       </div>
-                    `).join('')}
+                    `;
+                    }).join('')}
                   </div>
                 </div>
 
@@ -3219,7 +3327,27 @@
               class="grid gap-3 sm:gap-4 my-auto flex-1 items-stretch max-w-7xl mx-auto w-full"
               style="grid-template-columns: repeat(${teamCount}, minmax(0, 1fr));"
             >
-              ${activeTeams.map((team, idx) => `
+              ${activeTeams.map((team, idx) => {
+                const teamData = state.gameState?.teams?.[team.id] || (team.colorKey ? state.gameState?.teams?.[team.colorKey] : null) || state.gameState?.teams?.[getNormalizedTeamKey(team.id)];
+                const playerList = teamData?.players ? Object.values(teamData.players) : [];
+                const seen = new Set();
+                const cleanList = [];
+                playerList.forEach((p, pIdx) => {
+                  const trimmed = String(p?.name || '').trim();
+                  if (trimmed && !seen.has(trimmed.toLowerCase())) {
+                    seen.add(trimmed.toLowerCase());
+                    cleanList.push({ id: p?.id || ('fb-' + team.id + '-' + pIdx), name: trimmed });
+                  }
+                });
+                (team.members || []).forEach((m, mIdx) => {
+                  const trimmed = String(m?.name || '').trim();
+                  if (trimmed && !seen.has(trimmed.toLowerCase())) {
+                    seen.add(trimmed.toLowerCase());
+                    cleanList.push({ id: m?.id || ('m-' + team.id + '-' + mIdx), name: trimmed });
+                  }
+                });
+                const regCount = cleanList.length;
+                return `
                 <div
                   class="team-qr-card rounded-2xl border-4 flex flex-col items-center justify-between p-3 sm:p-4 bg-[#000428] text-center shadow-xl transition-all"
                   style="border-color: ${team.color};"
@@ -3233,7 +3361,7 @@
                       </span>
                     </div>
                     <span id="qr-team-count-${team.id}" class="text-xs font-mono font-bold block" style="color: ${team.color};">
-                      ${team.members.length} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} registrados
+                      ${regCount} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} registrados
                     </span>
                   </div>
 
@@ -3249,15 +3377,15 @@
                   <div class="w-full shrink-0 my-1 bg-[#00021A] rounded-xl p-2 border border-blue-950">
                     <div class="text-[10px] uppercase font-black text-blue-300 tracking-wider mb-1 flex items-center justify-between">
                       <span>Participantes:</span>
-                      <span id="qr-team-badge-count-${team.id}" class="text-emerald-400 font-bold font-mono">${team.members.length}</span>
+                      <span id="qr-team-badge-count-${team.id}" class="text-emerald-400 font-bold font-mono">${regCount}</span>
                     </div>
                     <div id="qr-team-members-${team.id}" class="flex flex-wrap gap-1 justify-center max-h-[70px] overflow-y-auto">
-                      ${team.members.length === 0 ? `
+                      ${regCount === 0 ? `
                         <span class="text-[11px] text-blue-400/60 italic py-1">
                           Esperando participantes...
                         </span>
-                      ` : team.members.map(m => `
-                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-900/90 text-white border border-blue-500 shadow-sm animate-in zoom-in-95">
+                      ` : cleanList.map(m => `
+                        <span key="qr-${team.id}-${m.id}" class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-900/90 text-white border border-blue-500 shadow-sm animate-in zoom-in-95">
                           <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
                           <span class="truncate max-w-[80px]">${m.name}</span>
                           <button
@@ -3283,7 +3411,8 @@
                     </button>
                   </div>
                 </div>
-              `).join('')}
+              `;
+              }).join('')}
             </div>
 
             <!-- Barra Inferior de Inicio de Tablero -->
@@ -4100,19 +4229,22 @@
             </div>
           `;
 
-          document.getElementById('player-join-form').addEventListener('submit', (e) => {
-            e.preventDefault();
-            sound.init();
-            const chosenName = document.getElementById('player-name-input').value.trim();
-            const chosenTeam = document.getElementById('player-team-select').value;
-            if (!chosenName) return;
+          function handleRegisterPlayer(chosenName, chosenTeam, playerId, activeRoom) {
+            const trimmed = chosenName.trim();
+            if (!trimmed) return;
 
-            const activeRoom = roomCodeParam || state.roomCode || 'JP-2025';
-            const memberId = 'm-' + Date.now();
+            const targetTeam = state.teams.find(t => 
+              t.id === chosenTeam || 
+              t.name.toLowerCase() === chosenTeam.toLowerCase() ||
+              t.id.toLowerCase() === chosenTeam.toLowerCase()
+            ) || state.teams[0];
 
-            localStorage.setItem('jeopardy_player_name', chosenName);
+            // playerTeamParam coincide exactamente con las claves de los equipos (azul, rojo, verde, amarillo, morado)
+            const playerTeamParam = getNormalizedTeamKey(targetTeam ? (targetTeam.colorKey || targetTeam.id) : chosenTeam);
+
+            localStorage.setItem('jeopardy_player_name', trimmed);
             localStorage.setItem('jeopardy_player_team', chosenTeam);
-            localStorage.setItem('jeopardy_player_id', memberId);
+            localStorage.setItem('jeopardy_player_id', playerId);
             localStorage.setItem('jeopardy_player_room', activeRoom);
             localStorage.setItem('jeopardy_player_registered', 'true');
 
@@ -4126,21 +4258,21 @@
             // 2. Limpiar duplicados del participante en otros equipos
             freshState.teams = (freshState.teams || []).map(t => ({
               ...t,
-              members: (t.members || []).filter(m => m.name.toLowerCase() !== chosenName.toLowerCase() && m.id !== memberId)
+              members: (t.members || []).filter(m => m.name.toLowerCase() !== trimmed.toLowerCase() && m.id !== playerId)
             }));
 
-            // 3. Agregar el participante al equipo seleccionado (por ID o por nombre)
-            let targetTeam = freshState.teams.find(t => 
+            // 3. Agregar el participante al equipo seleccionado
+            let destTeam = freshState.teams.find(t => 
               t.id === chosenTeam || 
               t.name.toLowerCase() === chosenTeam.toLowerCase() ||
               t.id.toLowerCase() === chosenTeam.toLowerCase()
             );
-            if (!targetTeam && freshState.teams.length > 0) targetTeam = freshState.teams[0];
-            if (targetTeam) {
-              if (!targetTeam.members) targetTeam.members = [];
-              targetTeam.members.push({
-                id: memberId,
-                name: chosenName,
+            if (!destTeam && freshState.teams.length > 0) destTeam = freshState.teams[0];
+            if (destTeam) {
+              if (!destTeam.members) destTeam.members = [];
+              destTeam.members.push({
+                id: playerId,
+                name: trimmed,
                 joinedAt: Date.now()
               });
             }
@@ -4150,10 +4282,11 @@
             // 4. Guardar sincrónicamente en la clave unificada de localStorage
             const joinPayload = {
               teamId: chosenTeam,
-              playerName: chosenName,
-              memberName: chosenName,
-              sessionId: memberId,
-              memberId: memberId,
+              teamKey: playerTeamParam,
+              playerName: trimmed,
+              memberName: trimmed,
+              sessionId: playerId,
+              memberId: playerId,
               roomCode: activeRoom
             };
 
@@ -4200,25 +4333,44 @@
               .catch(() => {});
             }
 
-            // 7. Sincronización en Firebase Realtime Database
-            // Ruta estricta requerida: /sessions/{sessionId}/teams/{teamId}/players/{playerId}
+            // 7. Sincronización exacta en Firebase Realtime Database
+            // Ruta y estructura exacta requerida:
+            // db.ref("jeopardy_game/teams/" + playerTeamParam + "/players/" + playerId).set({ id: playerId, name: trimmed, timestamp: firebase.database.ServerValue.TIMESTAMP });
             if (fbDb) {
-              const sessionId = getFirebaseSessionId();
-              const teamId = targetTeam ? targetTeam.id : chosenTeam;
-              const teamColorKey = targetTeam ? getTeamColorKey(targetTeam) : null;
-              const playerPayload = {
-                name: chosenName,
-                joinedAt: Date.now()
+              const db = fbDb;
+              const timestampVal = (typeof firebase !== 'undefined' && firebase.database && firebase.database.ServerValue)
+                ? firebase.database.ServerValue.TIMESTAMP
+                : Date.now();
+
+              const recordData = {
+                id: playerId,
+                name: trimmed,
+                timestamp: timestampVal
               };
 
-              // Guardar bajo /teams/{teamId}/players/{playerId}
-              fbDb.ref(`sessions/${sessionId}/teams/${teamId}/players/${memberId}`).set(playerPayload)
-                .catch(err => console.warn('Firebase push player error:', err));
+              // Guardado exacto bajo jeopardy_game/teams/...
+              db.ref("jeopardy_game/teams/" + playerTeamParam + "/players/" + playerId).set(recordData)
+                .catch(err => console.warn('Firebase jeopardy_game push player error:', err));
 
-              // Compatibilidad adicional con clave de color si difiere del ID
-              if (teamColorKey && teamColorKey !== teamId) {
-                fbDb.ref(`sessions/${sessionId}/teams/${teamColorKey}/players/${memberId}`).set(playerPayload)
+              if (targetTeam && targetTeam.id && targetTeam.id !== playerTeamParam) {
+                db.ref("jeopardy_game/teams/" + targetTeam.id + "/players/" + playerId).set(recordData)
                   .catch(() => {});
+              }
+
+              // Compatibilidad adicional con sessions/{sessionId}/teams/...
+              const sessionId = getFirebaseSessionId();
+              db.ref(`sessions/${sessionId}/teams/${playerTeamParam}/players/${playerId}`).set({
+                id: playerId,
+                name: trimmed,
+                joinedAt: Date.now()
+              }).catch(() => {});
+
+              if (targetTeam && targetTeam.id && targetTeam.id !== playerTeamParam) {
+                db.ref(`sessions/${sessionId}/teams/${targetTeam.id}/players/${playerId}`).set({
+                  id: playerId,
+                  name: trimmed,
+                  joinedAt: Date.now()
+                }).catch(() => {});
               }
             }
 
@@ -4227,6 +4379,19 @@
 
             sound.playJoin();
             render();
+          }
+
+          document.getElementById('player-join-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            sound.init();
+            const chosenName = document.getElementById('player-name-input').value.trim();
+            const chosenTeam = document.getElementById('player-team-select').value;
+            if (!chosenName) return;
+
+            const activeRoom = roomCodeParam || state.roomCode || 'JP-2025';
+            const memberId = 'm-' + Date.now();
+
+            handleRegisterPlayer(chosenName, chosenTeam, memberId, activeRoom);
           });
           return;
         }
