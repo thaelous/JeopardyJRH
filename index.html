@@ -891,18 +891,31 @@
 
           // Actualizar team.members unificado
           const playerList = Object.values(playersObj);
-          const currentMembers = [...(team.members || [])];
+          const seen = new Set();
+          const mergedMembers = [];
           playerList.forEach(p => {
-            const exists = currentMembers.some(m => m.name.toLowerCase() === p.name.toLowerCase() || m.id === p.id);
-            if (!exists) {
-              currentMembers.push({
+            const lower = String(p.name).trim().toLowerCase();
+            if (lower && !seen.has(lower)) {
+              seen.add(lower);
+              mergedMembers.push({
                 id: p.id,
-                name: p.name,
+                name: String(p.name).trim(),
                 joinedAt: p.timestamp || Date.now()
               });
             }
           });
-          team.members = currentMembers;
+          (team.members || []).forEach(m => {
+            const lower = String(m.name || '').trim().toLowerCase();
+            if (lower && !seen.has(lower)) {
+              seen.add(lower);
+              mergedMembers.push({
+                id: m.id,
+                name: String(m.name).trim(),
+                joinedAt: m.joinedAt || Date.now()
+              });
+            }
+          });
+          team.members = mergedMembers;
         });
 
         const newTotal = (state.teams || []).reduce((acc, t) => acc + (t.members?.length || 0), 0);
@@ -918,12 +931,88 @@
         updateLiveParticipantsDOM();
       }
 
+      // Función reactiva centralizada para procesar datos de Firebase y actualizar la UI inmediatamente
+      function setGameState(data) {
+        if (!data || typeof data !== 'object') return;
+        state.gameState = { ...(state.gameState || {}), ...data };
+        state.gameState.teams = state.gameState.teams || {};
+
+        // Capturar correctamente las ramas anidadas de teams
+        if (data.teams) {
+          syncTeamsDataFromFirebase(data.teams);
+        }
+
+        if (data.status === 'question_open' && data.currentQuestion) {
+          const q = data.currentQuestion;
+          if (!state.activeClue || state.activeClue.id !== q.id) {
+            state.activeClue = {
+              id: q.id,
+              questionId: q.id,
+              question: q.text || q.question,
+              answer: q.answer,
+              value: q.value,
+              categoryId: q.catId,
+              state: 'buzzing_open'
+            };
+          }
+        } else if (data.status === 'board' || !data.currentQuestion) {
+          state.activeClue = null;
+        }
+
+        if (data.showAnswer) {
+          state.gameState.showAnswer = true;
+          if (state.activeClue) state.activeClue.state = 'revealed';
+        } else if (data.showAnswer === false) {
+          state.gameState.showAnswer = false;
+        }
+
+        if (data.buzzQueue !== undefined) {
+          state.buzzerState.buzzQueue = data.buzzQueue || {};
+          state.buzzerState.buzzers = data.buzzQueue || {};
+        }
+        if (data.attemptedPlayerIds !== undefined) {
+          state.buzzerState.attemptedPlayerIds = data.attemptedPlayerIds || {};
+        }
+        if (data.activeTurn !== undefined) {
+          state.buzzerState.activeTurn = data.activeTurn || null;
+          if (data.activeTurn) {
+            state.buzzerState.buzzedTeamId = data.activeTurn.teamId;
+            state.buzzerState.buzzedPlayerName = data.activeTurn.playerName;
+          }
+        }
+
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(state));
+        } catch (e) {}
+
+        // Provocar el re-render de la lista y del contador inmediatamente sin necesidad de recargar la página
+        updateLiveParticipantsDOM();
+
+        if (currentRole === 'player') {
+          render();
+        } else if (state.status !== 'qrcodes' && state.status !== 'setup') {
+          render();
+        } else {
+          const qrGrid = document.getElementById('qr-cards-grid');
+          if (!qrGrid) render();
+        }
+      }
+
       function setupFirebaseSessionListeners() {
         if (!fbDb) return;
         const sessionId = getFirebaseSessionId();
+        const db = fbDb;
+
+        // Listener principal en tiempo real bajo /jeopardy_game
+        db.ref("jeopardy_game").off();
+        db.ref("jeopardy_game").on("value", (snapshot) => {
+          const data = snapshot.val();
+          if (data) setGameState(data);
+        });
 
         // 1. Escuchar la ruta limpia /jeopardy_game/teams en tiempo real
-        const jeopardyTeamsRef = fbDb.ref('jeopardy_game/teams');
+        const jeopardyTeamsRef = db.ref('jeopardy_game/teams');
         jeopardyTeamsRef.off();
         jeopardyTeamsRef.on('value', (snapshot) => {
           const teamsVal = snapshot.val();
@@ -933,7 +1022,7 @@
         });
 
         // 1B. Escuchar la ruta /sessions/{sessionId}/teams para participantes en tiempo real
-        const teamsRef = fbDb.ref(`sessions/${sessionId}/teams`);
+        const teamsRef = db.ref(`sessions/${sessionId}/teams`);
         teamsRef.off();
         teamsRef.on('value', (snapshot) => {
           const teamsVal = snapshot.val();
@@ -1126,41 +1215,7 @@
         jeopardyGameRef.on('value', (snapshot) => {
           const gVal = snapshot.val();
           if (gVal) {
-            state.gameState = { ...(state.gameState || {}), ...gVal };
-            if (gVal.status === 'question_open' && gVal.currentQuestion) {
-              const q = gVal.currentQuestion;
-              if (!state.activeClue || state.activeClue.id !== q.id) {
-                state.activeClue = {
-                  id: q.id,
-                  questionId: q.id,
-                  question: q.text || q.question,
-                  answer: q.answer,
-                  value: q.value,
-                  categoryId: q.catId,
-                  state: 'buzzing_open'
-                };
-              }
-            } else if (gVal.status === 'board' || !gVal.currentQuestion) {
-              state.activeClue = null;
-            } else if (gVal.showAnswer && state.activeClue) {
-              state.activeClue.state = 'revealed';
-            }
-
-            if (gVal.buzzQueue !== undefined) {
-              state.buzzerState.buzzQueue = gVal.buzzQueue || {};
-              state.buzzerState.buzzers = gVal.buzzQueue || {};
-            }
-            if (gVal.attemptedPlayerIds !== undefined) {
-              state.buzzerState.attemptedPlayerIds = gVal.attemptedPlayerIds || {};
-            }
-            if (gVal.activeTurn !== undefined) {
-              state.buzzerState.activeTurn = gVal.activeTurn || null;
-              if (gVal.activeTurn) {
-                state.buzzerState.buzzedTeamId = gVal.activeTurn.teamId;
-                state.buzzerState.buzzedPlayerName = gVal.activeTurn.playerName;
-              }
-            }
-            render();
+            setGameState(gVal);
           }
         });
       }
@@ -4240,7 +4295,8 @@
             ) || state.teams[0];
 
             // playerTeamParam coincide exactamente con las claves de los equipos (azul, rojo, verde, amarillo, morado)
-            const playerTeamParam = getNormalizedTeamKey(targetTeam ? (targetTeam.colorKey || targetTeam.id) : chosenTeam);
+            const rawParam = chosenTeam || assignedTeamId || (targetTeam ? (targetTeam.colorKey || targetTeam.id) : 'azul');
+            const playerTeamParam = getNormalizedTeamKey(rawParam).toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'azul';
 
             localStorage.setItem('jeopardy_player_name', trimmed);
             localStorage.setItem('jeopardy_player_team', chosenTeam);
@@ -4275,6 +4331,16 @@
                 name: trimmed,
                 joinedAt: Date.now()
               });
+
+              // Sincronizar gameState.teams localmente para respuesta inmediata
+              freshState.gameState = freshState.gameState || {};
+              freshState.gameState.teams = freshState.gameState.teams || {};
+              const pObj = {};
+              destTeam.members.forEach(m => {
+                pObj[m.id] = { id: m.id, name: m.name, timestamp: m.joinedAt || Date.now() };
+              });
+              freshState.gameState.teams[destTeam.id] = { id: destTeam.id, players: pObj };
+              freshState.gameState.teams[playerTeamParam] = { id: playerTeamParam, players: pObj };
             }
             freshState.lastUpdated = Date.now();
             state = freshState;
@@ -4336,8 +4402,8 @@
             // 7. Sincronización exacta en Firebase Realtime Database
             // Ruta y estructura exacta requerida:
             // db.ref("jeopardy_game/teams/" + playerTeamParam + "/players/" + playerId).set({ id: playerId, name: trimmed, timestamp: firebase.database.ServerValue.TIMESTAMP });
-            if (fbDb) {
-              const db = fbDb;
+            const db = fbDb || (typeof firebase !== 'undefined' && firebase.apps && firebase.apps.length ? firebase.database() : null);
+            if (db) {
               const timestampVal = (typeof firebase !== 'undefined' && firebase.database && firebase.database.ServerValue)
                 ? firebase.database.ServerValue.TIMESTAMP
                 : Date.now();
@@ -4345,7 +4411,8 @@
               const recordData = {
                 id: playerId,
                 name: trimmed,
-                timestamp: timestampVal
+                timestamp: timestampVal,
+                joinedAt: Date.now()
               };
 
               // Guardado exacto bajo jeopardy_game/teams/...
