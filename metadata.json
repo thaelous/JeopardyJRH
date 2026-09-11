@@ -1,0 +1,8 @@
+{
+  "name": "Jeopardy Live Show",
+  "description": "Juego interactivo de Jeopardy en tiempo real con pulsadores móviles por QR, sincronización instantánea y gestión de hasta 5 equipos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
