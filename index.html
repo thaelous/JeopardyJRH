@@ -326,11 +326,11 @@
 
       // Colores temáticos oficiales para hasta 5 equipos
       const DEFAULT_TEAMS_TEMPLATE = [
-        { id: 'team-1', name: 'Equipo Azul', colorKey: 'azul', color: '#2563EB', textColor: '#FFFFFF', score: 0, members: [] },
-        { id: 'team-2', name: 'Equipo Rojo', colorKey: 'rojo', color: '#DC2626', textColor: '#FFFFFF', score: 0, members: [] },
-        { id: 'team-3', name: 'Equipo Verde', colorKey: 'verde', color: '#16A34A', textColor: '#FFFFFF', score: 0, members: [] },
-        { id: 'team-4', name: 'Equipo Dorado', colorKey: 'dorado', color: '#CA8A04', textColor: '#FFFFFF', score: 0, members: [] },
-        { id: 'team-5', name: 'Equipo Morado', colorKey: 'morado', color: '#9333EA', textColor: '#FFFFFF', score: 0, members: [] }
+        { id: 'azul', name: 'Equipo Azul', colorKey: 'azul', color: '#2563EB', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'rojo', name: 'Equipo Rojo', colorKey: 'rojo', color: '#DC2626', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'verde', name: 'Equipo Verde', colorKey: 'verde', color: '#16A34A', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'amarillo', name: 'Equipo Amarillo', colorKey: 'amarillo', color: '#CA8A04', textColor: '#FFFFFF', score: 0, members: [] },
+        { id: 'morado', name: 'Equipo Morado', colorKey: 'morado', color: '#9333EA', textColor: '#FFFFFF', score: 0, members: [] }
       ];
 
       const DEFAULT_CATEGORIES = [
@@ -713,19 +713,14 @@
         window.addEventListener(evt, unlockAudioContext, { passive: true });
       });
 
-      // Generador de Room Code para emparejamiento WebRTC P2P
+      // Identificador de sala unificado
       function getOrCreateRoomCode() {
-        let code = localStorage.getItem('jeopardy_active_room_code');
-        if (!code) {
-          code = 'JEP' + Math.floor(1000 + Math.random() * 9000);
-          localStorage.setItem('jeopardy_active_room_code', code);
-        }
-        return code;
+        return 'EN VIVO';
       }
 
       function getDefaultState() {
         return {
-          roomCode: getOrCreateRoomCode(),
+          roomCode: 'EN VIVO',
           status: 'setup',
           title: 'Torneo Jeopardy Live Show',
           categories: JSON.parse(JSON.stringify(DEFAULT_CATEGORIES)),
@@ -760,7 +755,16 @@
           const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
           if (raw) {
             const parsed = JSON.parse(raw);
-            if (!parsed.roomCode) parsed.roomCode = getOrCreateRoomCode();
+            parsed.roomCode = 'EN VIVO';
+            const idMap = { 'team-1': 'azul', 'team-2': 'rojo', 'team-3': 'verde', 'team-4': 'amarillo', 'team-5': 'morado' };
+            if (Array.isArray(parsed.teams)) {
+              parsed.teams.forEach(t => {
+                if (idMap[t.id]) {
+                  t.id = idMap[t.id];
+                  t.colorKey = idMap[t.id];
+                }
+              });
+            }
             return parsed;
           }
         } catch (e) {}
@@ -771,9 +775,9 @@
       let isAuthenticated = sessionStorage.getItem(AUTH_KEY) === 'true';
 
       const urlParams = new URLSearchParams(window.location.search);
-      let currentRole = urlParams.get('role') === 'player' ? 'player' : 'host';
+      let currentRole = (urlParams.get('role') === 'player' || urlParams.has('team')) ? 'player' : 'host';
       let assignedTeamId = urlParams.get('team') || null;
-      let roomCodeParam = urlParams.get('room') || state.roomCode;
+      let roomCodeParam = 'EN VIVO';
 
       // --- ARQUITECTURA DE SINCRONIZACIÓN EN TIEMPO REAL ---
       // =========================================================================
@@ -822,8 +826,7 @@
       }
 
       function getFirebaseSessionId() {
-        const rawCode = state.roomCode || roomCodeParam || 'JEP1000';
-        return String(rawCode).replace(/[.#$\[\]]/g, '_');
+        return 'jeopardy_game';
       }
 
       function initFirebaseRealtimeDB() {
@@ -1487,7 +1490,7 @@
         if (typeof Peer === 'undefined') return;
 
         if (currentRole === 'host') {
-          const hostPeerId = `jeopardy-host-${state.roomCode}`;
+          const hostPeerId = `jeopardy-host-envivo`;
           try {
             hostPeer = new Peer(hostPeerId, { debug: 0 });
             hostPeer.on('open', () => {
@@ -1514,7 +1517,7 @@
             console.warn(e);
           }
         } else if (currentRole === 'player') {
-          const targetHostId = `jeopardy-host-${roomCodeParam}`;
+          const targetHostId = `jeopardy-host-envivo`;
           try {
             playerPeer = new Peer(null, { debug: 0 });
             playerPeer.on('open', () => {
@@ -1656,104 +1659,70 @@
         let totalConnected = 0;
 
         activeTeams.forEach((team) => {
-          // Lectura a prueba de fallos según directiva estricta:
-          const teamData = gameState?.teams?.[team.id] || (team.colorKey ? gameState?.teams?.[team.colorKey] : null) || gameState?.teams?.[getNormalizedTeamKey(team.id)];
-          const playerList = teamData?.players ? Object.values(teamData.players) : [];
-
-          // Mapear de forma limpia y única cada nombre de jugador garantizando claves únicas y filtrando duplicados o entradas vacías
-          const seenNames = new Set();
-          const cleanPlayerList = [];
-
-          // 1. Extraer desde playerList (Firebase)
-          playerList.forEach((p, pIdx) => {
-            const trimmedName = String(p?.name || '').trim();
-            if (!trimmedName) return;
-            const lower = trimmedName.toLowerCase();
-            if (!seenNames.has(lower)) {
-              seenNames.add(lower);
-              cleanPlayerList.push({
-                id: p?.id || ('fb-' + team.id + '-' + pIdx + '-' + lower),
-                name: trimmedName
-              });
-            }
-          });
-
-          // 2. Complementar con state.teams si hubiese miembros locales previos
-          (team.members || []).forEach((m, mIdx) => {
-            const trimmedName = String(m?.name || '').trim();
-            if (!trimmedName) return;
-            const lower = trimmedName.toLowerCase();
-            if (!seenNames.has(lower)) {
-              seenNames.add(lower);
-              cleanPlayerList.push({
-                id: m?.id || ('local-' + team.id + '-' + mIdx + '-' + lower),
-                name: trimmedName
-              });
-            }
-          });
-
-          team.members = cleanPlayerList;
-          const memberCount = cleanPlayerList.length;
+          const normKey = getNormalizedTeamKey(team.id || team.colorKey || team.name);
+          const teamNode = gameState?.teams?.[team.id] || (team.colorKey ? gameState?.teams?.[team.colorKey] : null) || gameState?.teams?.[normKey];
+          let playersMap = teamNode?.players || {};
+          if (Object.keys(playersMap).length === 0 && Array.isArray(team.members) && team.members.length > 0) {
+            playersMap = {};
+            team.members.forEach(m => {
+              playersMap[m.id] = { id: m.id, name: m.name };
+            });
+          }
+          const playersList = Object.values(playersMap);
+          const memberCount = playersList.length;
           totalConnected += memberCount;
 
           // 1. Vista de Códigos QR (renderQRCodesScreen)
           const countEl = document.getElementById(`qr-team-count-${team.id}`);
           if (countEl) {
-            countEl.textContent = `${memberCount} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} registrados`;
+            countEl.textContent = `${playersList.length} / 5 registrados`;
           }
           const badgeCountEl = document.getElementById(`qr-team-badge-count-${team.id}`);
           if (badgeCountEl) {
-            badgeCountEl.textContent = String(memberCount);
+            badgeCountEl.textContent = String(playersList.length);
           }
           const membersBox = document.getElementById(`qr-team-members-${team.id}`);
           if (membersBox) {
-            if (memberCount === 0) {
+            if (playersList.length === 0) {
               membersBox.innerHTML = `
-                <span class="text-[11px] text-blue-400/60 italic py-1">
+                <span class="text-[11px] text-blue-400/60 italic py-1 block text-center">
                   Esperando participantes...
                 </span>
               `;
             } else {
-              membersBox.innerHTML = cleanPlayerList.map((player) => `
-                <span key="qr-${team.id}-${player.id}" class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-900/90 text-white border border-blue-500 shadow-sm animate-in zoom-in-95">
-                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                  <span class="truncate max-w-[80px]">${player.name}</span>
-                  <button
-                    type="button"
-                    data-team-id="${team.id}"
-                    data-member-id="${player.id}"
-                    class="btn-remove-member hover:text-rose-400 text-xs font-black ml-0.5 cursor-pointer"
-                    title="Remover participante"
-                  >×</button>
-                </span>
-              `).join('');
-
-              membersBox.querySelectorAll('.btn-remove-member').forEach(btn => {
-                btn.addEventListener('click', (e) => {
-                  e.stopPropagation();
-                  const tId = btn.getAttribute('data-team-id');
-                  const mId = btn.getAttribute('data-member-id');
-                  dispatchAction('PLAYER_REMOVE', { teamId: tId, memberId: mId });
-                });
-              });
+              membersBox.innerHTML = `
+                <div class="space-y-1 w-full px-1">
+                  ${playersList.map((p) => `
+                    <div key="${p.id}" class="text-xs text-white font-bold flex justify-between items-center">
+                      <span>${escapeHtml(p.name)}</span>
+                      <span class="text-green-400 text-[11px]">● Listo</span>
+                    </div>
+                  `).join('')}
+                </div>
+              `;
             }
           }
 
           // 2. Vista de Configuración Inicial (renderSetupScreen)
           const setupCountEl = document.getElementById(`setup-team-count-${team.id}`);
           if (setupCountEl) {
-            setupCountEl.textContent = `${memberCount} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam}`;
+            setupCountEl.textContent = `${playersList.length} / 5 registrados`;
           }
           const setupMembersBox = document.getElementById(`setup-team-members-${team.id}`);
           if (setupMembersBox) {
-            if (memberCount === 0) {
-              setupMembersBox.innerHTML = `<span class="text-[10px] text-blue-400/60 italic py-1">Esperando...</span>`;
+            if (playersList.length === 0) {
+              setupMembersBox.innerHTML = `<span class="text-[10px] text-blue-400/60 italic py-1 block text-center">Esperando participantes...</span>`;
             } else {
-              setupMembersBox.innerHTML = cleanPlayerList.map((player) => `
-                <span key="setup-${team.id}-${player.id}" class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900 text-white border border-blue-500 shadow-sm">
-                  ${player.name}
-                </span>
-              `).join('');
+              setupMembersBox.innerHTML = `
+                <div class="space-y-1 w-full px-1">
+                  ${playersList.map((p) => `
+                    <div key="${p.id}" class="text-xs text-white font-bold flex justify-between items-center">
+                      <span>${escapeHtml(p.name)}</span>
+                      <span class="text-green-400 text-[11px]">● Listo</span>
+                    </div>
+                  `).join('')}
+                </div>
+              `;
             }
           }
         });
@@ -2936,7 +2905,7 @@
                     <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
                   </h1>
                   <span class="text-xs text-blue-200">
-                    Paso 1 de 2 • Sala: <strong class="text-[#FFCC00] font-mono">${state.roomCode}</strong>
+                    Paso 1 de 2 • Sala: <strong class="text-[#FFCC00] font-mono">EN VIVO</strong>
                   </span>
                 </div>
               </div>
@@ -3122,30 +3091,23 @@
 
                   <div class="grid gap-3 sm:gap-4 pt-2" style="grid-template-columns: repeat(${teamCount}, minmax(0, 1fr));">
                     ${state.teams.slice(0, teamCount).map((team) => {
-                      const teamData = state.gameState?.teams?.[team.id] || (team.colorKey ? state.gameState?.teams?.[team.colorKey] : null) || state.gameState?.teams?.[getNormalizedTeamKey(team.id)];
-                      const playerList = teamData?.players ? Object.values(teamData.players) : [];
-                      const seen = new Set();
-                      const playerNames = [];
-                      playerList.forEach(p => {
-                        const n = String(p?.name || '').trim();
-                        if (n && !seen.has(n.toLowerCase())) {
-                          seen.add(n.toLowerCase());
-                          playerNames.push(n);
-                        }
-                      });
-                      (team.members || []).forEach(m => {
-                        const n = String(m?.name || '').trim();
-                        if (n && !seen.has(n.toLowerCase())) {
-                          seen.add(n.toLowerCase());
-                          playerNames.push(n);
-                        }
-                      });
+                      const normKey = getNormalizedTeamKey(team.id || team.colorKey || team.name);
+                      const teamNode = state.gameState?.teams?.[team.id] || (team.colorKey ? state.gameState?.teams?.[team.colorKey] : null) || state.gameState?.teams?.[normKey];
+                      let playersMap = teamNode?.players || {};
+                      if (Object.keys(playersMap).length === 0 && Array.isArray(team.members) && team.members.length > 0) {
+                        playersMap = {};
+                        team.members.forEach(m => {
+                          playersMap[m.id] = { id: m.id, name: m.name };
+                        });
+                      }
+                      const playersList = Object.values(playersMap);
+                      const regCount = playersList.length;
                       return `
                       <div class="rounded-xl border-2 p-3 bg-[#000428] text-center shadow flex flex-col items-center justify-between" style="border-color: ${team.color};">
                         <div class="w-full pb-1 border-b border-blue-900/60 flex items-center justify-between">
                           <span class="text-white font-black text-xs uppercase truncate">${team.name}</span>
                           <span id="setup-team-count-${team.id}" class="text-[11px] font-mono font-bold" style="color: ${team.color};">
-                            ${playerNames.length} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam}
+                            ${regCount} / 5 registrados
                           </span>
                         </div>
                         <div class="my-2 p-1.5 sm:p-2 bg-white rounded-xl shadow inline-block">
@@ -3154,13 +3116,18 @@
                         <div class="w-full bg-[#00021A] rounded-lg p-1.5 text-center min-h-[48px]">
                           <span class="text-[9px] uppercase font-black text-blue-400 block mb-0.5">Registrados:</span>
                           <div id="setup-team-members-${team.id}" class="flex flex-wrap gap-1 justify-center max-h-[48px] overflow-y-auto">
-                            ${playerNames.length === 0 ? `
-                              <span class="text-[10px] text-blue-400/60 italic py-1">Esperando...</span>
-                            ` : playerNames.map((pName, pIdx) => `
-                              <span key="setup-${team.id}-${pIdx}" class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900 text-white border border-blue-500 shadow-sm">
-                                ${pName}
-                              </span>
-                            `).join('')}
+                            ${regCount === 0 ? `
+                              <span class="text-[10px] text-blue-400/60 italic py-1 block text-center">Esperando...</span>
+                            ` : `
+                              <div class="space-y-1 w-full px-1">
+                                ${playersList.map((p) => `
+                                  <div key="${p.id}" class="text-xs text-white font-bold flex justify-between items-center">
+                                    <span>${escapeHtml(p.name)}</span>
+                                    <span class="text-green-400 text-[11px]">● Listo</span>
+                                  </div>
+                                `).join('')}
+                              </div>
+                            `}
                           </div>
                         </div>
                       </div>
@@ -3292,7 +3259,7 @@
           const qrContainer = document.getElementById(`setup-qr-${team.id}`);
           if (qrContainer && typeof QRCode === 'function') {
             qrContainer.innerHTML = '';
-            const playerTeamUrl = `${baseUrl}?role=player&room=${state.roomCode}&team=${team.id}`;
+            const playerTeamUrl = `${window.location.origin}${window.location.pathname}?team=${team.id}`;
             new QRCode(qrContainer, {
               text: playerTeamUrl,
               width: setupQrSize,
@@ -3345,7 +3312,7 @@
                     <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
                   </h1>
                   <span class="text-xs text-blue-200">
-                    Paso 2 de 2: Códigos QR Dinámicos • Sala: <strong class="text-[#FFCC00] font-mono">${state.roomCode}</strong>
+                    Paso 2 de 2: Códigos QR Dinámicos • Sala: <strong class="text-[#FFCC00] font-mono">EN VIVO</strong>
                   </span>
                 </div>
               </div>
@@ -3383,25 +3350,9 @@
               style="grid-template-columns: repeat(${teamCount}, minmax(0, 1fr));"
             >
               ${activeTeams.map((team, idx) => {
-                const teamData = state.gameState?.teams?.[team.id] || (team.colorKey ? state.gameState?.teams?.[team.colorKey] : null) || state.gameState?.teams?.[getNormalizedTeamKey(team.id)];
-                const playerList = teamData?.players ? Object.values(teamData.players) : [];
-                const seen = new Set();
-                const cleanList = [];
-                playerList.forEach((p, pIdx) => {
-                  const trimmed = String(p?.name || '').trim();
-                  if (trimmed && !seen.has(trimmed.toLowerCase())) {
-                    seen.add(trimmed.toLowerCase());
-                    cleanList.push({ id: p?.id || ('fb-' + team.id + '-' + pIdx), name: trimmed });
-                  }
-                });
-                (team.members || []).forEach((m, mIdx) => {
-                  const trimmed = String(m?.name || '').trim();
-                  if (trimmed && !seen.has(trimmed.toLowerCase())) {
-                    seen.add(trimmed.toLowerCase());
-                    cleanList.push({ id: m?.id || ('m-' + team.id + '-' + mIdx), name: trimmed });
-                  }
-                });
-                const regCount = cleanList.length;
+                const playersMap = state.gameState?.teams?.[team.id]?.players || (team.colorKey ? state.gameState?.teams?.[team.colorKey]?.players : null) || {};
+                const playersList = Object.values(playersMap);
+                const regCount = playersList.length;
                 return `
                 <div
                   class="team-qr-card rounded-2xl border-4 flex flex-col items-center justify-between p-3 sm:p-4 bg-[#000428] text-center shadow-xl transition-all"
@@ -3416,7 +3367,7 @@
                       </span>
                     </div>
                     <span id="qr-team-count-${team.id}" class="text-xs font-mono font-bold block" style="color: ${team.color};">
-                      ${regCount} / ${state.maxMembersPerTeam >= 999 ? '∞' : state.maxMembersPerTeam} registrados
+                      ${regCount} / 5 registrados
                     </span>
                   </div>
 
@@ -3436,22 +3387,19 @@
                     </div>
                     <div id="qr-team-members-${team.id}" class="flex flex-wrap gap-1 justify-center max-h-[70px] overflow-y-auto">
                       ${regCount === 0 ? `
-                        <span class="text-[11px] text-blue-400/60 italic py-1">
+                        <span class="text-[11px] text-blue-400/60 italic py-1 block text-center">
                           Esperando participantes...
                         </span>
-                      ` : cleanList.map(m => `
-                        <span key="qr-${team.id}-${m.id}" class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-900/90 text-white border border-blue-500 shadow-sm animate-in zoom-in-95">
-                          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                          <span class="truncate max-w-[80px]">${m.name}</span>
-                          <button
-                            type="button"
-                            data-team-id="${team.id}"
-                            data-member-id="${m.id}"
-                            class="btn-remove-member hover:text-rose-400 text-xs font-black ml-0.5 cursor-pointer"
-                            title="Remover participante"
-                          >×</button>
-                        </span>
-                      `).join('')}
+                      ` : `
+                        <div class="space-y-1 w-full px-1">
+                          ${playersList.map((p) => `
+                            <div key="${p.id}" class="text-xs text-white font-bold flex justify-between items-center">
+                              <span>${escapeHtml(p.name)}</span>
+                              <span class="text-green-400 text-[11px]">● Listo</span>
+                            </div>
+                          `).join('')}
+                        </div>
+                      `}
                     </div>
                   </div>
 
@@ -3497,7 +3445,7 @@
           const qrContainer = document.getElementById(`qrcode-box-${team.id}`);
           if (qrContainer && typeof QRCode === 'function') {
             qrContainer.innerHTML = '';
-            const playerTeamUrl = `${baseUrl}?role=player&room=${state.roomCode}&team=${team.id}`;
+            const playerTeamUrl = `${window.location.origin}${window.location.pathname}?team=${team.id}`;
             new QRCode(qrContainer, {
               text: playerTeamUrl,
               width: qrSize,
@@ -3531,7 +3479,7 @@
         document.querySelectorAll('.btn-copy-team-link').forEach(btn => {
           btn.addEventListener('click', () => {
             const teamId = btn.getAttribute('data-team-id');
-            const link = `${baseUrl}?role=player&room=${state.roomCode}&team=${teamId}`;
+            const link = `${window.location.origin}${window.location.pathname}?team=${teamId}`;
             navigator.clipboard.writeText(link).then(() => {
               const prev = btn.textContent;
               btn.textContent = '¡Copiado!';
@@ -3673,7 +3621,7 @@
                     <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
                   </h1>
                   <span class="text-[11px] text-emerald-400 font-bold flex items-center gap-1 mt-0.5">
-                    Sala: <strong class="text-[#FFCC00] font-mono">${state.roomCode}</strong> • En Vivo
+                    Sala: <strong class="text-[#FFCC00] font-mono">EN VIVO</strong>
                   </span>
                 </div>
               </div>
@@ -4215,7 +4163,7 @@
                     <span class="w-2 h-2 rounded-full bg-emerald-400 sync-status-dot animate-pulse"></span>
                   </h2>
                   <p class="text-xs text-blue-200 mt-1">
-                    Sala: <strong class="text-[#FFCC00] font-mono">${roomCodeParam || state.roomCode}</strong>
+                    Sala: <strong class="text-[#FFCC00] font-mono">EN VIVO</strong>
                   </p>
                 </div>
 
@@ -4294,14 +4242,15 @@
               t.id.toLowerCase() === chosenTeam.toLowerCase()
             ) || state.teams[0];
 
-            // playerTeamParam coincide exactamente con las claves de los equipos (azul, rojo, verde, amarillo, morado)
+            // teamId coincide exactamente con las claves de los equipos (azul, rojo, verde, amarillo, morado)
             const rawParam = chosenTeam || assignedTeamId || (targetTeam ? (targetTeam.colorKey || targetTeam.id) : 'azul');
-            const playerTeamParam = getNormalizedTeamKey(rawParam).toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'azul';
+            const teamId = getNormalizedTeamKey(rawParam).toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'azul';
+            const playerName = trimmed;
 
             localStorage.setItem('jeopardy_player_name', trimmed);
-            localStorage.setItem('jeopardy_player_team', chosenTeam);
+            localStorage.setItem('jeopardy_player_team', teamId);
             localStorage.setItem('jeopardy_player_id', playerId);
-            localStorage.setItem('jeopardy_player_room', activeRoom);
+            localStorage.setItem('jeopardy_player_room', 'EN VIVO');
             localStorage.setItem('jeopardy_player_registered', 'true');
 
             // 1. Cargar el estado más reciente de localStorage para no sobreescribir datos del anfitrión
@@ -4319,9 +4268,9 @@
 
             // 3. Agregar el participante al equipo seleccionado
             let destTeam = freshState.teams.find(t => 
-              t.id === chosenTeam || 
-              t.name.toLowerCase() === chosenTeam.toLowerCase() ||
-              t.id.toLowerCase() === chosenTeam.toLowerCase()
+              t.id === teamId || 
+              t.name.toLowerCase() === teamId.toLowerCase() ||
+              t.id.toLowerCase() === teamId.toLowerCase()
             );
             if (!destTeam && freshState.teams.length > 0) destTeam = freshState.teams[0];
             if (destTeam) {
@@ -4340,20 +4289,20 @@
                 pObj[m.id] = { id: m.id, name: m.name, timestamp: m.joinedAt || Date.now() };
               });
               freshState.gameState.teams[destTeam.id] = { id: destTeam.id, players: pObj };
-              freshState.gameState.teams[playerTeamParam] = { id: playerTeamParam, players: pObj };
+              freshState.gameState.teams[teamId] = { id: teamId, players: pObj };
             }
             freshState.lastUpdated = Date.now();
             state = freshState;
 
             // 4. Guardar sincrónicamente en la clave unificada de localStorage
             const joinPayload = {
-              teamId: chosenTeam,
-              teamKey: playerTeamParam,
+              teamId: teamId,
+              teamKey: teamId,
               playerName: trimmed,
               memberName: trimmed,
               sessionId: playerId,
               memberId: playerId,
-              roomCode: activeRoom
+              roomCode: 'EN VIVO'
             };
 
             try {
@@ -4400,45 +4349,13 @@
             }
 
             // 7. Sincronización exacta en Firebase Realtime Database
-            // Ruta y estructura exacta requerida:
-            // db.ref("jeopardy_game/teams/" + playerTeamParam + "/players/" + playerId).set({ id: playerId, name: trimmed, timestamp: firebase.database.ServerValue.TIMESTAMP });
             const db = fbDb || (typeof firebase !== 'undefined' && firebase.apps && firebase.apps.length ? firebase.database() : null);
             if (db) {
-              const timestampVal = (typeof firebase !== 'undefined' && firebase.database && firebase.database.ServerValue)
-                ? firebase.database.ServerValue.TIMESTAMP
-                : Date.now();
-
-              const recordData = {
+              db.ref("jeopardy_game/teams/" + teamId + "/players/" + playerId).set({
                 id: playerId,
-                name: trimmed,
-                timestamp: timestampVal,
-                joinedAt: Date.now()
-              };
-
-              // Guardado exacto bajo jeopardy_game/teams/...
-              db.ref("jeopardy_game/teams/" + playerTeamParam + "/players/" + playerId).set(recordData)
-                .catch(err => console.warn('Firebase jeopardy_game push player error:', err));
-
-              if (targetTeam && targetTeam.id && targetTeam.id !== playerTeamParam) {
-                db.ref("jeopardy_game/teams/" + targetTeam.id + "/players/" + playerId).set(recordData)
-                  .catch(() => {});
-              }
-
-              // Compatibilidad adicional con sessions/{sessionId}/teams/...
-              const sessionId = getFirebaseSessionId();
-              db.ref(`sessions/${sessionId}/teams/${playerTeamParam}/players/${playerId}`).set({
-                id: playerId,
-                name: trimmed,
-                joinedAt: Date.now()
-              }).catch(() => {});
-
-              if (targetTeam && targetTeam.id && targetTeam.id !== playerTeamParam) {
-                db.ref(`sessions/${sessionId}/teams/${targetTeam.id}/players/${playerId}`).set({
-                  id: playerId,
-                  name: trimmed,
-                  joinedAt: Date.now()
-                }).catch(() => {});
-              }
+                name: playerName.trim(),
+                timestamp: Date.now()
+              }).catch(err => console.warn('Firebase push player error:', err));
             }
 
             // 8. Notificar por WebSocket y WebRTC P2P
@@ -4455,7 +4372,7 @@
             const chosenTeam = document.getElementById('player-team-select').value;
             if (!chosenName) return;
 
-            const activeRoom = roomCodeParam || state.roomCode || 'JP-2025';
+            const activeRoom = 'EN VIVO';
             const memberId = 'm-' + Date.now();
 
             handleRegisterPlayer(chosenName, chosenTeam, memberId, activeRoom);
@@ -4562,7 +4479,7 @@
                     ✓ ¡REGISTRADO EXITOSAMENTE!
                   </div>
                   <p class="text-xs font-bold text-white mt-0.5">
-                    Enlazado a Sala: <strong class="text-[#FFCC00] font-mono">${roomCodeParam || state.roomCode}</strong> • Equipo: <strong id="player-banner-team-name" style="color: ${myTeam.color};">${myTeam.name}</strong>
+                    Sala: <strong class="text-[#FFCC00] font-mono">EN VIVO</strong> • Equipo: <strong id="player-banner-team-name" style="color: ${myTeam.color};">${myTeam.name}</strong>
                   </p>
                   <p class="text-[11px] text-emerald-300 mt-0.5">
                     Tu nombre ya está visible en el ordenador del presentador.
